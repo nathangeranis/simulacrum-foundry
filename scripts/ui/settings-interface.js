@@ -6,6 +6,7 @@
 
 import { createLogger } from '../utils/logger.js';
 import { ToolPermissionsConfig } from './tool-permissions-config.js';
+import { schemaIndexService } from '../core/schema-index-service.js';
 
 /**
  * Helper function that converts an input field for a setting into a textarea.
@@ -78,6 +79,34 @@ export function registerAdvancedSettings() {
   _registerContextSettings();
   _registerStylingSettings();
   _registerToolPermissionSettings();
+  _registerSchemaIndexSettings();
+}
+
+function _registerSchemaIndexSettings() {
+  // Master gate for small-model adaptations. When enabled, pre-compiled
+  // document schemas are injected into the system prompt and schema-discovery
+  // tools are stripped from the tool palette. PR1 only registers the toggle —
+  // the consumers (system prompt injection, tool stripping) ship in PR2.
+  game.settings.register('simulacrum', 'smallModelMode', {
+    name: 'SIMULACRUM.Settings.SmallModelMode',
+    hint: 'SIMULACRUM.Settings.SmallModelModeHint',
+    scope: 'world',
+    config: true,
+    type: Boolean,
+    default: false,
+    restricted: true,
+    onChange: async value => {
+      try {
+        if (value) {
+          // Build the index now if it isn't fresh; the rebuild itself is
+          // gated by the cacheKey check inside the service.
+          await schemaIndexService.rebuildIndex({ force: false });
+        }
+      } catch (e) {
+        createLogger('Settings').warn('Failed to rebuild schema index after toggle:', e);
+      }
+    },
+  });
 }
 
 function _registerToolPermissionSettings() {

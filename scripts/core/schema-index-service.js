@@ -1,0 +1,941 @@
+/* eslint-disable max-lines */
+/**
+ * Schema Index Service - Pre-compiles per-template document schemas + shared
+ * top-level guidance content for injection into the system prompt under
+ * small-model mode.
+ *
+ * Storage: IndexedDB, keyed by `${systemId}@${systemVersion}|${moduleHash}`
+ * Build: Walks CONFIG document classes via DocumentAPI.getDocumentSchema and
+ * emits deterministic markdown describing each (documentType, subtype) pair.
+ *
+ * Sync strategy:
+ * - Cache-key based (not interval based): rebuild only when systemId,
+ *   systemVersion, or the set of modules contributing document types changes.
+ * - Initial build runs lazily: only when smallModelMode is enabled.
+ *   Disabled smallModelMode = zero work on world load.
+ */
+
+import { createLogger } from '../utils/logger.js';
+import { emitIndexStatus } from './hook-manager.js';
+import { DocumentAPI } from './document-api.js';
+
+const DB_NAME = 'simulacrum-schema-index';
+const DB_VERSION = 1;
+const MODULE_ID = 'simulacrum';
+
+// Field types to skip when emitting markdown (they bloat output without helping
+// small models). The names match DocumentAPI.#getFieldTypeName output, which
+// converts e.g. TypeDataField -> 'type_data'.
+const SKIP_FIELD_TYPES = new Set([
+  'type_data',
+  'embedded_collection',
+  'embedded_collection_delta',
+  'embedded_data',
+  'embedded_document',
+  'document_flags',
+  'document_stats',
+  'document_ownership',
+  'document_id',
+  'foreign_document',
+]);
+
+// Top-level field names to skip in markdown emission (Foundry housekeeping).
+const SKIP_FIELD_NAMES = new Set(['_stats', 'flags', '_id', 'ownership', 'sort']);
+
+// Cap on common fields shown in the worked example / common-fields list.
+const COMMON_FIELDS_LIMIT = 10;
+// Maximum recursion steps when walking nested SchemaFields. The first call
+// processes `system.*`, so a value of 3 means we can reach
+// `system.attributes.hp.value` (3 hops) but stop at any deeper chain. Tuned
+// for dnd5e/pf2e where required-leaf chains are typically 2-3 deep.
+const MAX_RECURSION_STEPS = 3;
+
+/**
+ * Deterministic 32-bit FNV-1a hash. Used for the module-set component of the
+ * cache key. Not cryptographic; we only need stable equality for "did the
+ * inputs change?" comparisons, and FNV-1a works synchronously in both browser
+ * and Node (unlike crypto.subtle.digest which is async-only in browsers).
+ *
+ * @param {string} str
+ * @returns {string} 8-char lowercase hex
+ */
+function fnv1a(str) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+// Type → example-value lookup. Drives the worked-JSON skeleton.
+const TYPE_EXAMPLE = {
+  string: '"<string>"',
+  html: '"<string>"',
+  file_path: '"<string>"',
+  number: '0',
+  numeric: '0',
+  boolean: 'false',
+  array: '[]',
+  set: '[]',
+  object: '{}',
+  schema: '{}',
+};
+
+/**
+ * Format a JSON value compactly for inclusion in worked examples.
+ * @param {object} fieldInfo
+ * @returns {string}
+ */
+function formatExampleValue(fieldInfo) {
+  if (Array.isArray(fieldInfo?.choices) && fieldInfo.choices.length > 0) {
+    return JSON.stringify(fieldInfo.choices[0]);
+  }
+  return TYPE_EXAMPLE[fieldInfo?.type] ?? '"<value>"';
+}
+
+class SchemaIndexService {
+  constructor() {
+    this.logger = createLogger('SchemaIndexService');
+    this.db = null;
+    this.isIndexing = false;
+    this.initialized = false;
+    this._initialIndexPromise = null;
+    this._initialIndexResolve = null;
+    this._initialIndexComplete = false;
+    this._templateCount = 0;
+    this._builtAt = null;
+    this._cacheKey = null;
+  }
+
+  /**
+   * Initialize the service - open DB, check cache, build if stale (when
+   * smallModelMode is enabled). Safe to call multiple times.
+   */
+  async initialize() {
+    if (this.initialized) return;
+
+    this.logger.info('Initializing schema index service...');
+
+    this._initialIndexPromise = new Promise(resolve => {
+      this._initialIndexResolve = resolve;
+    });
+
+    try {
+      this.db = await this._openDB();
+      this.logger.info('IndexedDB opened successfully');
+    } catch (err) {
+      this.logger.error('Failed to open IndexedDB, falling back to memory-only mode', err);
+      this.db = null;
+    }
+
+    const liveCacheKey = this._computeCacheKey();
+    const hasFreshCache = await this._checkExistingIndex(liveCacheKey);
+
+    if (hasFreshCache) {
+      this.logger.info(
+        `Using cached index: ${this._templateCount} templates, key=${this._cacheKey}`
+      );
+      this._initialIndexComplete = true;
+      this._initialIndexResolve();
+    } else {
+      const smallModelMode = this._readSmallModelMode();
+      if (smallModelMode) {
+        this.logger.info('No fresh cache and smallModelMode enabled; building index now');
+        // Don't await — run in background like AssetIndexService.
+        // rebuildIndex() resolves _initialIndexPromise on completion.
+        this.rebuildIndex();
+      } else {
+        // Resolve the promise so consumers awaiting readiness don't block.
+        // _initialIndexComplete stays false; getAvailability() returns
+        // {available: false} until smallModelMode is enabled and the index
+        // builds.
+        this.logger.info('No fresh cache; smallModelMode disabled, deferring build until enabled');
+        this._initialIndexResolve();
+      }
+    }
+
+    this.initialized = true;
+    this.logger.info('Schema index service initialized');
+  }
+
+  /**
+   * Read smallModelMode setting safely.
+   * @returns {boolean}
+   */
+  _readSmallModelMode() {
+    try {
+      return Boolean(game?.settings?.get(MODULE_ID, 'smallModelMode'));
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  /**
+   * Compute the live cache key from current system + active modules.
+   * @returns {string}
+   */
+  _computeCacheKey() {
+    const systemId = game?.system?.id ?? 'unknown';
+    const systemVersion = game?.system?.version ?? '0.0.0';
+    const moduleHash = this._moduleContributorsHash();
+    return `${systemId}@${systemVersion}|${moduleHash}`;
+  }
+
+  /**
+   * Hash the set of active modules that may contribute document types or
+   * dataModels. Only modules whose presence could change schema output are
+   * included so unrelated module toggles don't trigger rebuilds.
+   * @returns {string}
+   */
+  _moduleContributorsHash() {
+    if (!game?.modules) return fnv1a('');
+
+    const contributors = [];
+    for (const [id, mod] of game.modules.entries()) {
+      if (!mod?.active) continue;
+      // Heuristic: if the module registers Actors.types / Items.types / etc.
+      // through its module.json, we want to track its version. We approximate
+      // by including any active module — false positives just trigger occasional
+      // unnecessary rebuilds, which is acceptable.
+      contributors.push(`${id}@${mod.version ?? '0'}`);
+    }
+    contributors.sort();
+    return fnv1a(contributors.join('|'));
+  }
+
+  /**
+   * Open IndexedDB database with the three stores.
+   * @returns {Promise<IDBDatabase>}
+   */
+  _openDB() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+      request.onupgradeneeded = event => {
+        const db = event.target.result;
+        if (!db.objectStoreNames.contains('templates')) {
+          db.createObjectStore('templates', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('shared')) {
+          db.createObjectStore('shared', { keyPath: 'key' });
+        }
+        if (!db.objectStoreNames.contains('meta')) {
+          db.createObjectStore('meta', { keyPath: 'key' });
+        }
+      };
+
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  /**
+   * Check if the cached index matches the live cache key.
+   * @param {string} liveCacheKey
+   * @returns {Promise<boolean>}
+   */
+  async _checkExistingIndex(liveCacheKey) {
+    if (!this.db) return false;
+
+    try {
+      const storedKey = await this._readMeta('cacheKey');
+      if (!storedKey || storedKey !== liveCacheKey) return false;
+
+      const storedBuiltAt = await this._readMeta('builtAt');
+      const storedCount = await this._readMeta('templateCount');
+
+      this._cacheKey = storedKey;
+      this._builtAt = storedBuiltAt ? new Date(storedBuiltAt) : null;
+      this._templateCount = Number(storedCount) || 0;
+      return this._templateCount > 0;
+    } catch (err) {
+      this.logger.debug(`Failed to check existing index: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Read a single value from the meta store.
+   * @param {string} key
+   * @returns {Promise<unknown>}
+   */
+  _readMeta(key) {
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction('meta', 'readonly');
+      const request = tx.objectStore('meta').get(key);
+      request.onsuccess = () => resolve(request.result?.value);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  /**
+   * Rebuild the entire index from current CONFIG state. Skips when cache is
+   * already fresh unless `force` is true.
+   * @param {{force?: boolean}} [options]
+   */
+  async rebuildIndex({ force = false } = {}) {
+    if (this.isIndexing) {
+      this.logger.debug('Index rebuild already in progress, skipping');
+      return;
+    }
+    if (this._isCacheFreshSkippable(force)) {
+      this.logger.debug('Cache is fresh, skipping rebuild');
+      return;
+    }
+
+    this.isIndexing = true;
+    const startTime = Date.now();
+    const isInitialIndex = !this._initialIndexComplete;
+    this.logger.info(`Starting schema index rebuild${force ? ' (forced)' : ''}...`);
+    if (isInitialIndex) emitIndexStatus('start');
+
+    await this._clearStoresSafely();
+
+    const liveCacheKey = this._computeCacheKey();
+    const generatedAt = Date.now();
+    const documentTypes = DocumentAPI.getAllDocumentTypes();
+
+    const { templates, shared } = this._buildAllContent(documentTypes, generatedAt);
+
+    await this._persistIndex(templates, shared, liveCacheKey, generatedAt);
+
+    this._templateCount = templates.length;
+    this._builtAt = new Date(generatedAt);
+    this._cacheKey = liveCacheKey;
+    this.isIndexing = false;
+
+    if (!this._initialIndexComplete) {
+      this._initialIndexComplete = true;
+      if (this._initialIndexResolve) {
+        this._initialIndexResolve();
+        this._initialIndexResolve = null;
+      }
+      emitIndexStatus('complete', { templateCount: this._templateCount });
+    }
+
+    const elapsed = Date.now() - startTime;
+    this.logger.info(
+      `Schema index rebuild complete: ${templates.length} templates, ${shared.length} shared blocks in ${elapsed}ms`
+    );
+  }
+
+  /**
+   * Whether the cached index is current and the rebuild can be skipped.
+   * @param {boolean} force
+   * @returns {boolean}
+   */
+  _isCacheFreshSkippable(force) {
+    if (force) return false;
+    if (!this._initialIndexComplete) return false;
+    if (this._templateCount === 0) return false;
+    return this._cacheKey === this._computeCacheKey();
+  }
+
+  /**
+   * Clear stores; tolerate IndexedDB errors (memory-only fallback).
+   */
+  async _clearStoresSafely() {
+    if (!this.db) return;
+    try {
+      await this._clearStores();
+    } catch (err) {
+      this.logger.error('Failed to clear IndexedDB stores', err);
+    }
+  }
+
+  /**
+   * Walk document types and emit per-template + shared content arrays.
+   * @param {string[]} documentTypes
+   * @param {number} generatedAt
+   * @returns {{templates: object[], shared: object[]}}
+   */
+  _buildAllContent(documentTypes, generatedAt) {
+    const templates = [];
+    const shared = [];
+
+    for (const documentType of documentTypes) {
+      try {
+        this._collectTemplatesForType(documentType, generatedAt, templates);
+        const docFieldsContent = this._buildDocumentFieldsContent(documentType);
+        if (docFieldsContent) {
+          shared.push({
+            key: `doc_fields::${documentType}`,
+            content: docFieldsContent,
+            generatedAt,
+          });
+        }
+      } catch (err) {
+        this.logger.warn(`Failed to build entry for ${documentType}: ${err.message}`);
+      }
+    }
+
+    shared.push({ key: 'preamble', content: this._buildPreamble(documentTypes), generatedAt });
+    shared.push({ key: 'uuid_format', content: this._buildUuidFormat(), generatedAt });
+
+    return { templates, shared };
+  }
+
+  /**
+   * Push base + per-subtype template entries for a document type.
+   * @param {string} documentType
+   * @param {number} generatedAt
+   * @param {object[]} templates - mutated in place
+   */
+  _collectTemplatesForType(documentType, generatedAt, templates) {
+    const baseEntry = this._buildTemplateEntry(documentType, null);
+    if (baseEntry) {
+      templates.push({
+        id: `${documentType}::_base`,
+        documentType,
+        subtype: null,
+        content: baseEntry,
+        generatedAt,
+      });
+    }
+
+    const subtypes = game?.documentTypes?.[documentType] ?? [];
+    for (const subtype of subtypes) {
+      // Skip the synthetic 'base' subtype that some systems register
+      if (subtype === 'base') continue;
+      const entry = this._buildTemplateEntry(documentType, subtype);
+      if (entry) {
+        templates.push({
+          id: `${documentType}::${subtype}`,
+          documentType,
+          subtype,
+          content: entry,
+          generatedAt,
+        });
+      }
+    }
+  }
+
+  /**
+   * Persist templates + shared + meta to IndexedDB. Tolerates DB errors.
+   * @param {object[]} templates
+   * @param {object[]} shared
+   * @param {string} liveCacheKey
+   * @param {number} generatedAt
+   */
+  async _persistIndex(templates, shared, liveCacheKey, generatedAt) {
+    if (!this.db) return;
+    try {
+      await this._writeBatch(templates, shared);
+      await this._writeMeta({
+        cacheKey: liveCacheKey,
+        builtAt: generatedAt,
+        templateCount: templates.length,
+      });
+    } catch (err) {
+      this.logger.error('Failed to persist index to IndexedDB', err);
+    }
+  }
+
+  /**
+   * Clear all stores (used at start of rebuild).
+   */
+  async _clearStores() {
+    await new Promise((resolve, reject) => {
+      const tx = this.db.transaction(['templates', 'shared', 'meta'], 'readwrite');
+      tx.objectStore('templates').clear();
+      tx.objectStore('shared').clear();
+      tx.objectStore('meta').delete('cacheKey');
+      tx.objectStore('meta').delete('builtAt');
+      tx.objectStore('meta').delete('templateCount');
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  /**
+   * Write batches to templates + shared stores in a single transaction.
+   * @param {Array<object>} templates
+   * @param {Array<object>} shared
+   */
+  async _writeBatch(templates, shared) {
+    if (!this.db) return;
+    if (templates.length === 0 && shared.length === 0) return;
+
+    await new Promise((resolve, reject) => {
+      const tx = this.db.transaction(['templates', 'shared'], 'readwrite');
+      const tStore = tx.objectStore('templates');
+      const sStore = tx.objectStore('shared');
+      for (const t of templates) tStore.put(t);
+      for (const s of shared) sStore.put(s);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  /**
+   * Write meta entries.
+   * @param {Record<string, unknown>} entries
+   */
+  async _writeMeta(entries) {
+    if (!this.db) return;
+    await new Promise((resolve, reject) => {
+      const tx = this.db.transaction('meta', 'readwrite');
+      const store = tx.objectStore('meta');
+      for (const [key, value] of Object.entries(entries)) {
+        store.put({ key, value });
+      }
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  /**
+   * Build the markdown entry for one (documentType, subtype) pair. Returns
+   * null when the schema can't be retrieved.
+   * @param {string} documentType
+   * @param {string|null} subtype
+   * @returns {string|null}
+   */
+  _buildTemplateEntry(documentType, subtype) {
+    const schema = DocumentAPI.getDocumentSchema(documentType, subtype || undefined);
+    if (!schema) return null;
+    return this._buildTemplateEntryFromSchema(documentType, subtype, schema);
+  }
+
+  /**
+   * Pure markdown generation from a pre-fetched schema. Separated from
+   * _buildTemplateEntry so unit tests can inject fixture schemas without
+   * needing the full Foundry CONFIG environment.
+   * @param {string} documentType
+   * @param {string|null} subtype
+   * @param {object} schema - Output of DocumentAPI.getDocumentSchema
+   * @returns {string}
+   */
+  _buildTemplateEntryFromSchema(documentType, subtype, schema) {
+    const heading = subtype ? `## ${documentType} (${subtype})` : `## ${documentType} (base)`;
+    const description = this._describeTemplate(documentType, subtype);
+    const minimalJson = this._buildMinimalJSON(documentType, subtype, schema);
+    const commonFields = this._formatCommonFields(schema);
+    const advancedFields = this._formatAdvancedFields(schema);
+
+    const sections = [
+      heading,
+      description,
+      '',
+      '### Minimum viable create_document call',
+      minimalJson,
+    ];
+
+    if (commonFields) {
+      sections.push('', '### Common system.* fields', commonFields);
+    }
+    if (advancedFields) {
+      sections.push(
+        '',
+        '### Advanced fields (use inspect_document_schema for details)',
+        advancedFields
+      );
+    }
+
+    return sections.join('\n');
+  }
+
+  /**
+   * Produce a one-sentence description for a template. Pulls from CONFIG
+   * typeLabels / localization when available; falls back to a generic phrase.
+   * @param {string} documentType
+   * @param {string|null} subtype
+   * @returns {string}
+   */
+  _describeTemplate(documentType, subtype) {
+    if (!subtype) {
+      return `Base schema for ${documentType} documents (subtype not yet selected).`;
+    }
+    try {
+      const labelKey = CONFIG?.[documentType]?.typeLabels?.[subtype];
+      if (labelKey && typeof game?.i18n?.localize === 'function') {
+        const localized = game.i18n.localize(labelKey);
+        if (localized && localized !== labelKey) {
+          return `${localized} (${documentType} subtype "${subtype}").`;
+        }
+      }
+    } catch (_e) {
+      // fall through to generic
+    }
+    return `${documentType} document with subtype "${subtype}".`;
+  }
+
+  /**
+   * Build the worked-example JSON block for create_document. Uses required
+   * leaves only, depth-capped at MAX_RECURSION_STEPS.
+   * @param {string} documentType
+   * @param {string|null} subtype
+   * @param {object} schema
+   * @returns {string} fenced JSON block
+   */
+  _buildMinimalJSON(documentType, subtype, schema) {
+    const data = {
+      name: '"<string>"',
+    };
+    if (subtype) {
+      data.type = JSON.stringify(subtype);
+    }
+    // img is conventional for visual document types; include when present
+    if (schema.fieldDetails?.img) {
+      data.img = '"<path or omit>"';
+    }
+
+    const systemBlock = this._buildSystemSkeleton(schema.systemFieldDetails, 0);
+    if (systemBlock) {
+      data.system = systemBlock;
+    }
+
+    const dataBlock = this._renderJSONLike(data, 2);
+    const wrapper = `{\n  "documentType": ${JSON.stringify(documentType)},\n  "data": ${dataBlock}\n}`;
+    return '```json\n' + wrapper + '\n```';
+  }
+
+  /**
+   * Recursively assemble a skeleton object containing only required leaves,
+   * up to MAX_RECURSION_STEPS levels deep. Returns null when nothing required is
+   * found at the current level (caller can omit the system block entirely).
+   *
+   * @param {object|undefined} fieldDetails
+   * @param {number} depth
+   * @returns {Record<string, string|object>|null}
+   */
+  _buildSystemSkeleton(fieldDetails, depth) {
+    if (!fieldDetails || typeof fieldDetails !== 'object') return null;
+    if (depth >= MAX_RECURSION_STEPS) return null;
+
+    const out = {};
+    for (const [name, info] of Object.entries(fieldDetails)) {
+      if (this._shouldSkipSchemaField(name, info)) continue;
+      if (!info.required) continue;
+      const value = this._renderSkeletonField(info, depth);
+      if (value !== undefined) out[name] = value;
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
+
+  /**
+   * Whether a field should be omitted from skeleton/common/advanced lists.
+   * @param {string} name
+   * @param {object} info
+   * @returns {boolean}
+   */
+  _shouldSkipSchemaField(name, info) {
+    if (SKIP_FIELD_NAMES.has(name)) return true;
+    if (!info || typeof info !== 'object') return true;
+    if (SKIP_FIELD_TYPES.has(info.type)) return true;
+    return false;
+  }
+
+  /**
+   * Render a single field as a skeleton value: recurse into nested SchemaFields,
+   * or emit a primitive example. Returns undefined to signal "skip this field."
+   * @param {object} info
+   * @param {number} depth
+   * @returns {string|object|undefined}
+   */
+  _renderSkeletonField(info, depth) {
+    if (info.nested && typeof info.nested === 'object') {
+      const nested = this._buildSystemSkeleton(info.nested, depth + 1);
+      if (nested && Object.keys(nested).length > 0) return nested;
+      return undefined;
+    }
+    if (info.isCollection || info.isMapping) return undefined;
+    return formatExampleValue(info);
+  }
+
+  /**
+   * Render a JS object as JSON-like text where string values that are already
+   * formatted (start with '"') are emitted verbatim and other primitives use
+   * JSON.stringify. Indented to match the surrounding block.
+   * @param {object} obj
+   * @param {number} indent
+   * @returns {string}
+   */
+  _renderJSONLike(obj, indent) {
+    const pad = ' '.repeat(indent);
+    const childPad = ' '.repeat(indent + 2);
+    const entries = Object.entries(obj).map(([k, v]) => {
+      let rendered;
+      if (typeof v === 'string') {
+        rendered = v;
+      } else if (v && typeof v === 'object') {
+        rendered = this._renderJSONLike(v, indent + 2);
+      } else {
+        rendered = JSON.stringify(v);
+      }
+      return `${childPad}${JSON.stringify(k)}: ${rendered}`;
+    });
+    return `{\n${entries.join(',\n')}\n${pad}}`;
+  }
+
+  /**
+   * Format the "Common system.* fields" markdown list. Picks the top
+   * COMMON_FIELDS_LIMIT fields, required first, then non-required ranked by
+   * presence of choices / hint.
+   * @param {object} schema
+   * @returns {string|null}
+   */
+  _formatCommonFields(schema) {
+    const details = schema.systemFieldDetails;
+    if (!details || typeof details !== 'object' || details.$ref) return null;
+
+    const candidates = [];
+    for (const [name, info] of Object.entries(details)) {
+      if (this._shouldSkipSchemaField(name, info)) continue;
+      candidates.push({ name, info });
+    }
+
+    candidates.sort((a, b) => {
+      const aReq = a.info.required ? 1 : 0;
+      const bReq = b.info.required ? 1 : 0;
+      if (aReq !== bReq) return bReq - aReq;
+      const aHas = a.info.choices ? 1 : 0;
+      const bHas = b.info.choices ? 1 : 0;
+      if (aHas !== bHas) return bHas - aHas;
+      return a.name.localeCompare(b.name);
+    });
+
+    const top = candidates.slice(0, COMMON_FIELDS_LIMIT);
+    if (top.length === 0) return null;
+
+    return top.map(({ name, info }) => this._formatFieldLine(name, info)).join('\n');
+  }
+
+  /**
+   * Format a single field as a markdown bullet line.
+   */
+  _formatFieldLine(name, info) {
+    const parts = [`- \`system.${name}\` (${info.type || 'unknown'})`];
+    if (info.required) parts.push('**required**');
+    if (Array.isArray(info.choices) && info.choices.length > 0) {
+      const sample = info.choices
+        .slice(0, 5)
+        .map(c => `\`${c}\``)
+        .join(', ');
+      parts.push(`choices: ${sample}${info.choices.length > 5 ? ', ...' : ''}`);
+    }
+    return parts.join(' — ');
+  }
+
+  /**
+   * Format the "Advanced fields" list - terse names only.
+   * @param {object} schema
+   * @returns {string|null}
+   */
+  _formatAdvancedFields(schema) {
+    const details = schema.systemFieldDetails;
+    if (!details || typeof details !== 'object' || details.$ref) return null;
+
+    const allNames = Object.keys(details).filter(
+      name => !this._shouldSkipSchemaField(name, details[name])
+    );
+
+    if (allNames.length === 0) return null;
+
+    // Subtract the COMMON_FIELDS_LIMIT we'll emit in the common-fields block.
+    // For simplicity, emit the full list here — the common block already
+    // shows the top ones, so listing all names here is redundant but cheap.
+    // Skip if there's nothing beyond what's covered by common fields.
+    if (allNames.length <= COMMON_FIELDS_LIMIT) return null;
+
+    const remainder = allNames.sort();
+    return remainder.map(n => `\`system.${n}\``).join(', ');
+  }
+
+  /**
+   * Build the preamble shared content. Explains create_document call shape.
+   * @param {string[]} documentTypes
+   * @returns {string}
+   */
+  _buildPreamble(documentTypes) {
+    const typesSummary = documentTypes.length > 0 ? documentTypes.join(', ') : '(none)';
+    return [
+      '## Document Schemas',
+      '',
+      'This section is the authoritative reference for creating documents in this world.',
+      'When CREATING new documents, construct payloads directly from the entries below.',
+      'Use `read_document` only on existing documents you intend to MODIFY or DELETE.',
+      '',
+      '### Calling create_document',
+      '',
+      'Every `create_document` call requires:',
+      '- `documentType` — top-level type from this list: ' + typesSummary,
+      '- `data.name` — string, the document name',
+      '- `data.type` — subtype (e.g. `"npc"`, `"weapon"`); see per-template entries below',
+      '- `data.system.*` — system-specific fields, see per-template entries',
+      '',
+      'For document types not covered below, fall back to `inspect_document_schema(documentType, subtype)`.',
+    ].join('\n');
+  }
+
+  /**
+   * Build the UUID format reference content, with live world ID and pack list.
+   * @returns {string}
+   */
+  _buildUuidFormat() {
+    const worldId = game?.world?.id ?? '<world>';
+    const packs = game?.packs ? Array.from(game.packs).map(p => p.collection) : [];
+    const PACK_SAMPLE_LIMIT = 5;
+    const sampled = packs.slice(0, PACK_SAMPLE_LIMIT);
+    const truncatedNote =
+      packs.length > PACK_SAMPLE_LIMIT
+        ? `\n- ...and ${packs.length - PACK_SAMPLE_LIMIT} more (use \`list_documents\` to enumerate)`
+        : '';
+    const packsSample =
+      sampled.length > 0 ? '- ' + sampled.join('\n- ') + truncatedNote : '- (none)';
+
+    return [
+      '## UUID Format Conventions',
+      '',
+      'Foundry documents are referenced by UUID. The format depends on where the document lives.',
+      '',
+      '**World documents (in this world):**',
+      '`@UUID[<DocType>.<id>]` or `@UUID[<DocType>.<id>]{Display Name}`',
+      `Example: \`@UUID[Actor.abc123]\` (world: ${worldId})`,
+      '',
+      '**Compendium documents (in a pack):**',
+      '`@UUID[Compendium.<scope>.<pack>.<DocType>.<id>]`',
+      'Example: `@UUID[Compendium.dnd5e.heroes.Actor.xyz789]{Hero Name}`',
+      '',
+      '**Embedded documents (Items inside an Actor, Pages inside a Journal):**',
+      '`@UUID[<ParentType>.<parentId>.<EmbeddedType>.<embeddedId>]`',
+      'Example: `@UUID[Actor.abc123.Item.def456]`',
+      '',
+      'Available compendium pack scopes in this world:',
+      packsSample,
+    ].join('\n');
+  }
+
+  /**
+   * Build per-DocType top-level fields content, including embedded-creation
+   * guidance for types with hierarchy. PR3 will flesh this out further.
+   * @param {string} documentType
+   * @returns {string|null}
+   */
+  _buildDocumentFieldsContent(documentType) {
+    const documentClass = CONFIG?.[documentType]?.documentClass;
+    if (!documentClass) return null;
+
+    const lines = [`## ${documentType} — Top-level fields`, ''];
+    lines.push('Standard top-level fields for any ' + documentType + ' document:');
+    lines.push('- `name` (string, **required**) — display name');
+    lines.push('- `type` (string, **required**) — subtype identifier (see schemas above)');
+    lines.push('- `img` (file_path) — image path; use `search_assets` to find valid paths');
+    lines.push('- `folder` (string|null) — folder ID for organization');
+
+    const hierarchy = documentClass.hierarchy;
+    if (hierarchy && Object.keys(hierarchy).length > 0) {
+      lines.push('');
+      lines.push(`### Embedded children of ${documentType}`);
+      lines.push('');
+      const embeddedNames = Object.keys(hierarchy);
+      lines.push(
+        `${documentType} can contain embedded documents of these types: ${embeddedNames.join(', ')}.`
+      );
+      lines.push(
+        `These are NOT created as standalone documents — they exist only as children of a ${documentType}.`
+      );
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Get the compiled prompt string ready to inject. Concatenates preamble,
+   * UUID format, all per-DocType fields content, and all per-template entries
+   * in a deterministic order.
+   * @returns {Promise<string>}
+   */
+  async getCompiledPrompt() {
+    if (this._initialIndexPromise && !this._initialIndexComplete) {
+      await this._initialIndexPromise;
+    }
+    if (!this.db) return '';
+
+    const [shared, templates] = await Promise.all([
+      this._readAll('shared'),
+      this._readAll('templates'),
+    ]);
+
+    const sections = [];
+    const sharedByKey = new Map(shared.map(s => [s.key, s]));
+
+    // Order: preamble, uuid_format, per-DocType fields (sorted), per-template entries (sorted)
+    if (sharedByKey.has('preamble')) sections.push(sharedByKey.get('preamble').content);
+    if (sharedByKey.has('uuid_format')) sections.push(sharedByKey.get('uuid_format').content);
+
+    const docFields = shared
+      .filter(s => s.key.startsWith('doc_fields::'))
+      .sort((a, b) => a.key.localeCompare(b.key));
+    for (const df of docFields) sections.push(df.content);
+
+    const sortedTemplates = templates.slice().sort((a, b) => a.id.localeCompare(b.id));
+    for (const t of sortedTemplates) sections.push(t.content);
+
+    return sections.join('\n\n');
+  }
+
+  /**
+   * Read all records from a store.
+   * @param {string} storeName
+   * @returns {Promise<object[]>}
+   */
+  _readAll(storeName) {
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction(storeName, 'readonly');
+      const request = tx.objectStore(storeName).getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  /**
+   * Get index stats.
+   * @returns {{templateCount: number, builtAt: Date|null, cacheKey: string|null, isIndexing: boolean}}
+   */
+  getStats() {
+    return {
+      templateCount: this._templateCount,
+      builtAt: this._builtAt,
+      cacheKey: this._cacheKey,
+      isIndexing: this.isIndexing,
+    };
+  }
+
+  /**
+   * Whether the index is ready for consumption.
+   * @returns {boolean}
+   */
+  isReady() {
+    return this.db !== null && this._initialIndexComplete;
+  }
+
+  /**
+   * Availability contract used by tools / system prompt builder.
+   * @returns {{available: boolean, reason?: string}}
+   */
+  getAvailability() {
+    if (!this.db) {
+      return { available: false, reason: 'IndexedDB not available' };
+    }
+    if (!this._initialIndexComplete) {
+      return { available: false, reason: 'Initial indexing in progress or not yet started' };
+    }
+    if (this._templateCount === 0) {
+      return { available: false, reason: 'No templates indexed' };
+    }
+    return { available: true };
+  }
+
+  /**
+   * Teardown hook for parity with AssetIndexService. SchemaIndexService has no
+   * heartbeat to stop, but we expose this for symmetry.
+   */
+  stopSync() {
+    /* no-op — schema index is not interval-driven */
+  }
+}
+
+// Singleton instance
+export const schemaIndexService = new SchemaIndexService();

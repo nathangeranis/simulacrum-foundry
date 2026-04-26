@@ -27,7 +27,9 @@
       },
       "Save": "Save Changes",
       "FallbackContextLimit": "Fallback Context Limit",
-      "FallbackContextLimitHint": "Token limit used when context window cannot be derived from model API. Most modern models have 32k-128k context."
+      "FallbackContextLimitHint": "Token limit used when context window cannot be derived from model API. Most modern models have 32k-128k context.",
+      "SmallModelMode": "Small Model Mode",
+      "SmallModelModeHint": "Optimize for small local models (7B-14B parameters). Pre-compiles document schemas into the system prompt and strips schema-discovery tools to avoid chunked-read death loops. Frontier models (Claude, GPT-4o) should leave this disabled."
     },
     "ToolPermissionsConfig": {
       "Title": "Tool Permissions Configuration"
