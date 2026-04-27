@@ -89,6 +89,12 @@ const COMPLEX_FIELD_TYPES = new Set([
   'spellcasting',
 ]);
 
+// Schema-discovery tool names that become redundant + harmful when the
+// compiled prompt is injected. Stripping them under smallModelMode avoids
+// the chunked-read death-loop trap that triggered when small models tried
+// to walk paginated schema dumps.
+const SCHEMA_DISCOVERY_TOOL_NAMES = new Set(['inspect_document_schema', 'list_document_schemas']);
+
 // Cap on common fields shown in the worked example / common-fields list.
 const COMMON_FIELDS_LIMIT = 10;
 // Maximum recursion steps when walking nested SchemaFields. The first call
@@ -1120,6 +1126,24 @@ class SchemaIndexService {
       return { available: false, reason: 'No templates indexed' };
     }
     return { available: true };
+  }
+
+  /**
+   * Filter the LLM tool list for the current request. When small-model mode
+   * is on AND the index has compiled content available to inject, strip the
+   * schema-discovery tools (inspect_document_schema, list_document_schemas)
+   * — they're redundant and small models trip over their paginated output.
+   * Otherwise pass through unchanged.
+   * @param {Array<{function?: {name: string}}>} schemas - tool schemas as
+   *   produced by toolRegistry.getToolSchemas()
+   * @returns {Array} filtered (or original) schemas
+   */
+  filterToolSchemas(schemas) {
+    if (!Array.isArray(schemas)) return schemas;
+    if (!this._readSmallModelMode()) return schemas;
+    if (!this.isReady()) return schemas;
+    if (this._templateCount === 0) return schemas;
+    return schemas.filter(s => !SCHEMA_DISCOVERY_TOOL_NAMES.has(s?.function?.name));
   }
 
   /**

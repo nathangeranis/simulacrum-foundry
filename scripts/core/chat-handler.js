@@ -203,8 +203,9 @@ class ChatHandler {
     const { processToolCallLoop } = await import('./tool-loop-handler.js');
     const { SimulacrumCore } = await import('./simulacrum-core.js');
     const { toolRegistry } = await import('./tool-registry.js');
+    const { schemaIndexService } = await import('./schema-index-service.js');
 
-    const tools = toolRegistry.getToolSchemas();
+    const tools = schemaIndexService.filterToolSchemas(toolRegistry.getToolSchemas());
     const legacyMode = game?.settings?.get('simulacrum', 'legacyMode') ?? false;
     const currentToolSupport = !legacyMode;
 

@@ -6,6 +6,7 @@
 
 import { createLogger } from '../utils/logger.js';
 import { toolRegistry } from './tool-registry.js';
+import { schemaIndexService } from './schema-index-service.js';
 
 const logger = createLogger('SystemPrompt');
 
@@ -70,10 +71,20 @@ export async function getAvailableMacrosList() {
 export async function buildSystemPrompt() {
   const documentTypesInfo = getDocumentTypesInfo();
   const legacyMode = game?.settings?.get('simulacrum', 'legacyMode') || false;
+  const smallModelMode = game?.settings?.get('simulacrum', 'smallModelMode') || false;
   const customSystemPrompt = game?.settings?.get('simulacrum', 'customSystemPrompt') || '';
 
   // Fetch available macros (World + Module) for execution context
   const macrosList = await getAvailableMacrosList();
+
+  // Pre-compiled schema index — only injected under smallModelMode and only
+  // when the index has content. Fetched once up-front so the i18n + assembly
+  // path stays synchronous.
+  const schemaIndexAvailable =
+    smallModelMode && !legacyMode && schemaIndexService.getAvailability().available;
+  const compiledSchemaContent = schemaIndexAvailable
+    ? await schemaIndexService.getCompiledPrompt()
+    : '';
 
   let basePrompt;
 
@@ -120,6 +131,20 @@ export async function buildSystemPrompt() {
       game.i18n.localize('SIMULACRUM.SystemPrompt.Legacy.TaskTracking'),
       game.i18n.localize('SIMULACRUM.SystemPrompt.Legacy.EndTask'),
       toolSchemas,
+    ].join('\n\n');
+  } else if (compiledSchemaContent) {
+    // Small-model mode with compiled index ready: rule-1 variant + schema
+    // injection between CRITICAL RULES and document-types summary.
+    basePrompt = [
+      game.i18n.localize('SIMULACRUM.SystemPrompt.Standard.Identity'),
+      game.i18n.localize('SIMULACRUM.SystemPrompt.SmallModel.CriticalRules'),
+      compiledSchemaContent,
+      documentTypesInfo,
+      game.i18n.localize('SIMULACRUM.SystemPrompt.Standard.StrategicProtocol'),
+      game.i18n.localize('SIMULACRUM.SystemPrompt.Standard.ToolOperatives'),
+      `## Available Macros\nThe following macros are available for execution via the execute_macro tool:\n${macrosList}`,
+      game.i18n.localize('SIMULACRUM.SystemPrompt.Standard.CommunicationStyle_v2'),
+      game.i18n.localize('SIMULACRUM.SystemPrompt.Standard.LoopTermination'),
     ].join('\n\n');
   } else {
     basePrompt = [

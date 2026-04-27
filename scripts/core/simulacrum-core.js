@@ -6,6 +6,7 @@ import { createLogger, isDebugEnabled } from '../utils/logger.js';
 import { AIClient } from './ai-client.js';
 import { COMPACTION_STATUS, ConversationManager, MAX_COMPACTION_ROUNDS } from './conversation.js';
 import { toolRegistry } from './tool-registry.js';
+import { schemaIndexService } from './schema-index-service.js';
 import { documentReadRegistry } from '../utils/document-read-registry.js';
 import { toolPermissionManager } from './tool-permission-manager.js';
 
@@ -190,8 +191,13 @@ class SimulacrumCore {
         }
       }
 
-      // Get available tools (use provided tools or default from registry)
-      let tools = options.tools !== undefined ? options.tools : toolRegistry.getToolSchemas();
+      // Get available tools (use provided tools or default from registry).
+      // Filter through schemaIndexService — strips schema-discovery tools
+      // when smallModelMode is on and the compiled schema index is ready.
+      let tools =
+        options.tools !== undefined
+          ? options.tools
+          : schemaIndexService.filterToolSchemas(toolRegistry.getToolSchemas());
       // Diagnostics: log tool schemas sent (names only)
       try {
         if (isDebugEnabled()) {
