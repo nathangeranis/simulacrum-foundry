@@ -833,6 +833,21 @@ class SchemaIndexService {
       minimalJson,
     ];
 
+    // Inline reminder for documents with embedded children. Crucial to
+    // sit BETWEEN the skeleton and the Common Fields list — the latter
+    // surfaces dnd5e patterns like `system.skills`/`system.spells`
+    // (plural mappings under system) that small models pattern-match
+    // into "embedded items must go in `system.<plural>`". Three Grunk
+    // runs each invented a different system-nested field
+    // (`system.items`, `system.inventory`, `system.weapons`); the
+    // section-level callout earlier in the prompt was getting drowned
+    // out by the per-template content. This puts the rule directly
+    // adjacent to the misleading patterns.
+    const reminder = this._embeddedChildrenReminder(documentType);
+    if (reminder) {
+      sections.push('', reminder);
+    }
+
     if (common.markdown) {
       sections.push('', '### Common system.* fields', common.markdown);
     }
@@ -845,6 +860,34 @@ class SchemaIndexService {
     }
 
     return sections.join('\n');
+  }
+
+  /**
+   * Inline embedded-children reminder block for a per-template entry.
+   * Returns null when the document type declares no hierarchy.
+   * @param {string} documentType
+   * @returns {string|null}
+   */
+  _embeddedChildrenReminder(documentType) {
+    const hierarchy = CONFIG?.[documentType]?.documentClass?.hierarchy;
+    if (!hierarchy || Object.keys(hierarchy).length === 0) return null;
+
+    const correctFields = Object.keys(hierarchy)
+      .map(f => `\`data.${f}\``)
+      .join(' / ');
+    const invented = Object.keys(hierarchy)
+      .flatMap(f => [`\`data.system.${f}\``, '`data.system.weapons`', '`data.system.inventory`'])
+      .filter((v, i, a) => a.indexOf(v) === i)
+      .slice(0, 4)
+      .join(', ');
+
+    return [
+      `### Embedded children placement (REQUIRED)`,
+      '',
+      `Embedded children of this \`${documentType}\` go in ${correctFields} (TOP-LEVEL on \`data\`, NOT under \`data.system\`).`,
+      `Foundry has no ${invented}, etc. — those field names are invented and silently ignored, leaving the parent with no children.`,
+      `The Common system.* fields below describe \`data.system\` content; embedded child arrays are NOT listed there.`,
+    ].join('\n');
   }
 
   /**
