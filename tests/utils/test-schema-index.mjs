@@ -349,25 +349,25 @@ function testEmbeddedChildrenStubInSkeleton() {
 }
 
 /**
- * Inline embedded-children reminder appears in each per-template entry
- * for a document type with hierarchy. Sits between the skeleton and
- * Common Fields — empirically the section-level callout alone wasn't
- * enough; small models kept inventing `data.system.<X>` field names
- * because they pattern-match the plural mappings (skills/spells/tools)
- * in the Common Fields list. Templates with NO hierarchy must NOT emit
- * the reminder (it'd be irrelevant noise on Item, RollTable, etc.).
+ * Embedded children appear BEFORE the system block in the per-template
+ * skeleton. Putting items at the end of `data` (after the heavy system
+ * block) made small models pattern-match items into system; bringing
+ * them up to the top — visually adjacent to `name` and `type` — makes
+ * the top-level placement structurally obvious without needing
+ * separate "DO NOT" warnings (which themselves caused regression).
  */
-function testInlineEmbeddedReminderInPerTemplateEntry() {
+function testEmbeddedFieldsPrecedeSystemInSkeleton() {
   const service = schemaIndexService;
   const originalCONFIG = globalThis.CONFIG;
+  const originalDocumentTypes = globalThis.game.documentTypes;
   globalThis.CONFIG = {
     Actor: {
-      documentClass: { hierarchy: { items: { metadata: { name: 'Item' } }, effects: {} } },
+      documentClass: { hierarchy: { items: { metadata: { name: 'Item' } } } },
     },
-    Item: { documentClass: { hierarchy: {} } },
   };
+  globalThis.game.documentTypes = { Item: ['weapon'] };
 
-  const actorFixture = {
+  const fixture = {
     type: 'Actor',
     subtype: 'npc',
     fields: ['name', 'type'],
@@ -381,35 +381,20 @@ function testInlineEmbeddedReminderInPerTemplateEntry() {
       },
     },
   };
-  const actorMd = service._buildTemplateEntryFromSchema('Actor', 'npc', actorFixture);
-  assert.match(actorMd, /Embedded children placement/, 'reminder header present on Actor');
-  assert.match(actorMd, /TOP-LEVEL/, 'reminder emphasizes top-level placement');
-  assert.match(actorMd, /data\.system\.items/, 'reminder names invented system-nested patterns');
+  const md = service._buildTemplateEntryFromSchema('Actor', 'npc', fixture);
+  const jsonMatch = md.match(/```json\n([\s\S]*?)\n```/);
+  const jsonText = jsonMatch[1];
 
-  // Reminder must sit BEFORE the Common Fields list so it's adjacent to
-  // the misleading plural-collection patterns.
-  const reminderIdx = actorMd.indexOf('Embedded children placement');
-  const commonIdx = actorMd.indexOf('Common system.* fields');
-  assert.ok(reminderIdx > 0 && commonIdx > 0);
-  assert.ok(reminderIdx < commonIdx, 'reminder must precede Common Fields section');
-
-  // Item has no hierarchy → no reminder (would be irrelevant noise).
-  const itemFixture = {
-    type: 'Item',
-    subtype: 'weapon',
-    fields: ['name', 'type'],
-    fieldDetails: { name: { type: 'string', required: true } },
-    systemFields: ['damage'],
-    systemFieldDetails: { damage: { type: 'string', required: true } },
-  };
-  const itemMd = service._buildTemplateEntryFromSchema('Item', 'weapon', itemFixture);
-  assert.equal(
-    /Embedded children placement/.test(itemMd),
-    false,
-    'no reminder when documentType has no hierarchy'
+  const itemsIdx = jsonText.indexOf('"items":');
+  const systemIdx = jsonText.indexOf('"system":');
+  assert.ok(itemsIdx > 0 && systemIdx > 0);
+  assert.ok(
+    itemsIdx < systemIdx,
+    'items must appear before system in the skeleton (visual prominence for top-level placement)'
   );
 
   globalThis.CONFIG = originalCONFIG;
+  globalThis.game.documentTypes = originalDocumentTypes;
 }
 
 /**
@@ -612,7 +597,7 @@ testStaticSnapshot();
 testCacheKeyDeterminism();
 testCommonLeafSurfacing();
 testEmbeddedChildrenStubInSkeleton();
-testInlineEmbeddedReminderInPerTemplateEntry();
+testEmbeddedFieldsPrecedeSystemInSkeleton();
 testEmbeddedChildrenCommonMistakesCallout();
 testInitialValueRendering();
 testFilterToolSchemasByIntent();
