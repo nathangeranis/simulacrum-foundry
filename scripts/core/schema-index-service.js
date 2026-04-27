@@ -55,6 +55,19 @@ const NON_CREATABLE_DOCUMENT_TYPES = new Set([
   'Folder',
 ]);
 
+// Field names where DocumentAPI's fuzzy CONFIG-namespace choice lookup is
+// known reliable across systems. For these fields we surface the choices
+// in Common Fields display (helps the model see valid values) but still
+// keep them out of skeleton defaults (model shouldn't blindly copy the
+// first choice as the answer). Add field names here only after manual
+// verification on the target system.
+const TRUSTED_CONFIG_CHOICE_FIELDS = new Set([
+  'school', // dnd5e spell schools (abj, con, div, ...)
+  'rarity', // item rarity (common, uncommon, rare, ...)
+  'size', // creature/object size (tiny, sm, med, lg, ...)
+  'alignment', // alignment (lg, ng, cg, ...)
+]);
+
 // DataModel-class field types that aren't primitives — emitted by
 // DocumentAPI as the class name (e.g. 'activities', 'advancement_collection').
 // In Common Fields we mark these as complex so the model knows not to
@@ -435,11 +448,10 @@ class SchemaIndexService {
   }
 
   /**
-   * Push base + per-subtype template entries for a document type.
-   *
-   * Drops the (base) entry when:
-   *   - the type has subtypes (real types use subtype entries)
-   *   - the base entry has no system data to show (pure boilerplate)
+   * Push template entries for a document type. Skips empty entries (pure
+   * boilerplate with no system data) and consolidates them into a single
+   * `(any subtype)` entry that lists valid subtype names without repeating
+   * the call shape for each.
    *
    * @param {string} documentType
    * @param {number} generatedAt
@@ -449,31 +461,101 @@ class SchemaIndexService {
     const subtypes = (game?.documentTypes?.[documentType] ?? []).filter(s => s !== 'base');
 
     if (subtypes.length === 0) {
-      // No subtypes: emit base entry only if it has system content
-      const baseEntry = this._buildTemplateEntry(documentType, null);
-      if (baseEntry && this._entryHasSystemContent(baseEntry)) {
-        templates.push({
-          id: `${documentType}::_base`,
-          documentType,
-          subtype: null,
-          content: baseEntry,
-          generatedAt,
-        });
-      }
+      this._collectBaseOnly(documentType, generatedAt, templates);
+      return;
     }
 
+    const { meaningful, empty } = this._partitionSubtypes(documentType, subtypes);
+
+    for (const { subtype, entry } of meaningful) {
+      templates.push({
+        id: `${documentType}::${subtype}`,
+        documentType,
+        subtype,
+        content: entry,
+        generatedAt,
+      });
+    }
+
+    if (empty.length > 0) {
+      const consolidatedSubtypes = meaningful.length > 0 ? empty : subtypes;
+      templates.push({
+        id: `${documentType}::_any`,
+        documentType,
+        subtype: null,
+        content: this._buildConsolidatedSubtypeEntry(documentType, consolidatedSubtypes),
+        generatedAt,
+      });
+    }
+  }
+
+  /**
+   * Emit the base entry for a type that has no subtypes, but only when it
+   * has system content worth showing.
+   */
+  _collectBaseOnly(documentType, generatedAt, templates) {
+    const baseEntry = this._buildTemplateEntry(documentType, null);
+    if (!baseEntry || !this._entryHasSystemContent(baseEntry)) return;
+    templates.push({
+      id: `${documentType}::_base`,
+      documentType,
+      subtype: null,
+      content: baseEntry,
+      generatedAt,
+    });
+  }
+
+  /**
+   * Build template entries for each subtype and partition into "meaningful"
+   * (has system content) vs "empty" (pure boilerplate).
+   * @param {string} documentType
+   * @param {string[]} subtypes
+   * @returns {{meaningful: Array<{subtype:string,entry:string}>, empty: string[]}}
+   */
+  _partitionSubtypes(documentType, subtypes) {
+    const meaningful = [];
+    const empty = [];
     for (const subtype of subtypes) {
       const entry = this._buildTemplateEntry(documentType, subtype);
-      if (entry) {
-        templates.push({
-          id: `${documentType}::${subtype}`,
-          documentType,
-          subtype,
-          content: entry,
-          generatedAt,
-        });
+      if (!entry) continue;
+      if (this._entryHasSystemContent(entry)) {
+        meaningful.push({ subtype, entry });
+      } else {
+        empty.push(subtype);
       }
     }
+    return { meaningful, empty };
+  }
+
+  /**
+   * Build a single entry for a parent document type whose subtypes have no
+   * system-specific fields. Lists the valid subtype names and shows the
+   * call shape once.
+   * @param {string} documentType
+   * @param {string[]} subtypes
+   * @returns {string}
+   */
+  _buildConsolidatedSubtypeEntry(documentType, subtypes) {
+    const subtypeUnion = subtypes.map(s => JSON.stringify(s)).join(' | ');
+    const skeleton = {
+      name: '"<string>"',
+      type: `<${subtypes.join('|')}>`,
+    };
+    const heading = `## ${documentType} (any of: ${subtypes.join(', ')})`;
+    const description = `${documentType} subtypes \`${subtypes.join('`, `')}\` have no system-specific fields. Pick one for \`data.type\`.`;
+    const dataBlock = this._renderJSONLike(skeleton, 2);
+    const wrapper = `{\n  "documentType": ${JSON.stringify(documentType)},\n  "data": ${dataBlock}\n}`;
+    const json = '```json\n' + wrapper + '\n```';
+
+    return [
+      heading,
+      description,
+      '',
+      `Valid \`data.type\` values: ${subtypeUnion}`,
+      '',
+      '### Minimum viable create_document call',
+      json,
+    ].join('\n');
   }
 
   /**
@@ -769,8 +851,8 @@ class SchemaIndexService {
       const aReq = a.info.required ? 1 : 0;
       const bReq = b.info.required ? 1 : 0;
       if (aReq !== bReq) return bReq - aReq;
-      const aHas = this._hasTrustedChoices(a.info) ? 1 : 0;
-      const bHas = this._hasTrustedChoices(b.info) ? 1 : 0;
+      const aHas = this._hasDisplayableChoices(a.name, a.info) ? 1 : 0;
+      const bHas = this._hasDisplayableChoices(b.name, b.info) ? 1 : 0;
       if (aHas !== bHas) return bHas - aHas;
       return a.name.localeCompare(b.name);
     });
@@ -784,23 +866,26 @@ class SchemaIndexService {
   }
 
   /**
-   * Whether `info.choices` came from the field's own `choices` declaration
-   * (trusted) rather than the fuzzy CONFIG namespace lookup in
-   * DocumentAPI.#lookupConfigChoices (untrusted — produces false matches
-   * like "type: required" or "units: turn").
+   * Whether `info.choices` is suitable for display in the Common Fields
+   * list. Trusts choices declared on the field directly; for fuzzy
+   * CONFIG-derived choices, only trusts whitelisted field names where the
+   * fuzzy match is known reliable. The skeleton (formatExampleValue)
+   * applies a stricter rule — never trusts CONFIG-fuzzy as a default value
+   * even when whitelisted, because models tend to copy defaults verbatim.
+   * @param {string} name
    * @param {object} info
    * @returns {boolean}
    */
-  _hasTrustedChoices(info) {
-    return (
-      Array.isArray(info?.choices) && info.choices.length > 0 && info.choicesSource !== 'CONFIG'
-    );
+  _hasDisplayableChoices(name, info) {
+    if (!Array.isArray(info?.choices) || info.choices.length === 0) return false;
+    if (info.choicesSource !== 'CONFIG') return true;
+    return TRUSTED_CONFIG_CHOICE_FIELDS.has(name);
   }
 
   /**
    * Format a single field as a markdown bullet line. Annotates DataModel-
    * class types as (complex) so the model knows it can't construct them
-   * inline. Skips choices that came from fuzzy CONFIG matching.
+   * inline. Shows choices when displayable (trusted source or whitelisted).
    */
   _formatFieldLine(name, info) {
     const typeName = info.type || 'unknown';
@@ -808,7 +893,7 @@ class SchemaIndexService {
     const typeLabel = isComplex ? `${typeName}; complex, use inspect_document_schema` : typeName;
     const parts = [`- \`system.${name}\` (${typeLabel})`];
     if (info.required) parts.push('**required**');
-    if (this._hasTrustedChoices(info)) {
+    if (this._hasDisplayableChoices(name, info)) {
       const sample = info.choices
         .slice(0, 5)
         .map(c => `\`${c}\``)
