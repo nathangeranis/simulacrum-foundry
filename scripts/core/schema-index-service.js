@@ -903,11 +903,13 @@ class SchemaIndexService {
       data.system = systemBlock;
     }
 
-    // Embedded children placeholders — anchors the model to the right
-    // nesting position. Empty `[]` keeps the skeleton minimal; the
-    // per-DocType "Embedded children" section shows the full payload shape.
-    for (const fieldName of this._embeddedFieldNames(documentType)) {
-      data[fieldName] = '[]';
+    // Embedded children: show a top-level array with one stub child to
+    // anchor structure. Empty `[]` was insufficient — small models read
+    // the empty slot as "not used here" and invented `data.system.<madeup>`
+    // (e.g. `data.system.inventory`) to satisfy their training-data prior.
+    // A populated stub gives them a fill-in-the-blank target.
+    for (const stub of this._embeddedFieldStubs(documentType)) {
+      data[stub.fieldName] = stub.literal;
     }
 
     const dataBlock = this._renderJSONLike(data, 2);
@@ -916,15 +918,39 @@ class SchemaIndexService {
   }
 
   /**
-   * Names of top-level embedded-children fields for a document type, derived
-   * from `documentClass.hierarchy`. Empty list when no hierarchy declared.
+   * Embedded-children stubs for the per-template JSON skeleton. Each stub
+   * is a `{ fieldName, literal }` pair where `literal` is a pre-rendered
+   * string emitted verbatim by `_renderJSONLike` (it bypasses the recursive
+   * object-render path because we want to control multi-line indentation).
+   *
+   * Stub shape: `[ { "name": "<child name>", "type": "<subtype>" } ]` for
+   * children whose document type has subtypes (Item, JournalEntryPage),
+   * `[ { "name": "<child name>" } ]` otherwise (ActiveEffect). The `type`
+   * hint in the stub is what stops the model from omitting `type` on
+   * embedded items — its absence is what made dnd5e Item creation fail.
+   *
    * @param {string} documentType
-   * @returns {string[]}
+   * @returns {Array<{fieldName: string, literal: string}>}
    */
-  _embeddedFieldNames(documentType) {
+  _embeddedFieldStubs(documentType) {
     const hierarchy = CONFIG?.[documentType]?.documentClass?.hierarchy;
     if (!hierarchy) return [];
-    return Object.keys(hierarchy);
+
+    const stubs = [];
+    for (const [fieldName, fieldDef] of Object.entries(hierarchy)) {
+      const childType = this._extractEmbeddedChildType(fieldDef) ?? fieldName;
+      const childLower = childType.toLowerCase();
+      const childSubtypes = (game?.documentTypes?.[childType] ?? []).filter(s => s !== 'base');
+      const stubObject =
+        childSubtypes.length > 0
+          ? `{ "name": "<${childLower} name>", "type": "<${childLower} subtype>" }`
+          : `{ "name": "<${childLower} name>" }`;
+      stubs.push({
+        fieldName,
+        literal: `[\n      ${stubObject}\n    ]`,
+      });
+    }
+    return stubs;
   }
 
   /**
@@ -1329,6 +1355,8 @@ class SchemaIndexService {
       'These embedded children are NOT created as standalone documents. To create them, populate the array on the parent at `create_document` time — each entry is a full create-payload (with its own `name`, `type`, `system`, etc.). Modifying an existing parent uses `update_document` with the same array shape.'
     );
 
+    lines.push('', ...this._embeddedChildrenMistakesCallout(fields));
+
     const exampleField = fields[0];
     lines.push('', `### Example: ${documentType} with embedded ${exampleField.childType}`, '');
     lines.push('```json');
@@ -1346,6 +1374,25 @@ class SchemaIndexService {
     lines.push('```');
 
     return lines.join('\n');
+  }
+
+  /**
+   * "Common mistakes" sub-block emitted inside _buildEmbeddedChildrenSection.
+   * Extracted so the parent stays under the per-function line cap. Calls
+   * out the specific failure modes observed empirically (small models
+   * inventing `data.system.inventory` rather than using `data.items`).
+   * @param {Array<{fieldName: string}>} fields
+   * @returns {string[]} lines (caller joins with \n)
+   */
+  _embeddedChildrenMistakesCallout(fields) {
+    const fieldList = fields.map(f => `\`data.${f.fieldName}\``).join(' / ');
+    return [
+      '### Common mistakes (DO NOT do these)',
+      '',
+      `- **Do NOT** put embedded children under \`data.system.*\`. They are TOP-LEVEL fields on \`data\`: ${fieldList}.`,
+      '- **Do NOT** invent a system-nested array name like `data.system.inventory`, `data.system.items`, or similar. Use the documented field above.',
+      `- **Do NOT** call \`create_document\` separately for each embedded child — embed them in the parent's array.`,
+    ];
   }
 
   /**

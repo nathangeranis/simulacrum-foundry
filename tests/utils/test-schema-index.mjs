@@ -286,22 +286,30 @@ function testCommonLeafSurfacing() {
 }
 
 /**
- * Embedded-children placeholder: when the documentClass declares an embedded
+ * Embedded-children stub: when the documentClass declares an embedded
  * hierarchy (Actor → items, JournalEntry → pages), the per-template JSON
- * skeleton must include a top-level `[]` placeholder for each. Without
- * this, models faithfully fill in `data.system.*` and then nest items
- * under `data.system.items` because the system section pulls them in.
+ * skeleton must include a top-level array with a populated stub child
+ * for each. Empty `[]` was insufficient — small models read the empty
+ * array as "not used here" and invented `data.system.<madeup>` to
+ * satisfy their training-data prior. The stub is a fill-in-the-blank
+ * target: `{"name": "<...>", "type": "<...>"}`.
  */
-function testEmbeddedChildrenPlaceholderInSkeleton() {
+function testEmbeddedChildrenStubInSkeleton() {
   const service = schemaIndexService;
   // Simulate Foundry's CONFIG.<DocType>.documentClass.hierarchy for Actor.
   const originalCONFIG = globalThis.CONFIG;
+  const originalDocumentTypes = globalThis.game.documentTypes;
   globalThis.CONFIG = {
     Actor: {
       documentClass: {
         hierarchy: { items: { metadata: { name: 'Item' } }, effects: {} },
       },
     },
+  };
+  // Item has subtypes (so stub gets a `type` hint); ActiveEffect doesn't.
+  globalThis.game.documentTypes = {
+    Item: ['weapon', 'equipment'],
+    ActiveEffect: [],
   };
 
   const fixture = {
@@ -322,16 +330,46 @@ function testEmbeddedChildrenPlaceholderInSkeleton() {
   const jsonMatch = md.match(/```json\n([\s\S]*?)\n```/);
   assert.ok(jsonMatch);
   const jsonText = jsonMatch[1];
-  assert.match(jsonText, /"items": \[\]/, 'items placeholder present');
-  assert.match(jsonText, /"effects": \[\]/, 'effects placeholder present');
+
+  // items has subtypes → stub includes `type` hint
+  assert.match(jsonText, /"items": \[\s*\{ "name": "<item name>", "type": "<item subtype>" \}/);
+  // effects has no subtypes → stub is name-only
+  assert.match(jsonText, /"effects": \[\s*\{ "name": "<.*?name>" \}/);
 
   // Items must be at the SAME indent as `system` (i.e. a sibling under
-  // `data`), not nested inside the system block. Compare leading whitespace.
+  // `data`), not nested inside the system block.
   const systemIndent = jsonText.match(/^( +)"system":/m)?.[1];
   const itemsIndent = jsonText.match(/^( +)"items":/m)?.[1];
   assert.ok(systemIndent, 'system line found');
   assert.ok(itemsIndent, 'items line found');
   assert.equal(itemsIndent, systemIndent, 'items must be a sibling of system, not nested');
+
+  globalThis.CONFIG = originalCONFIG;
+  globalThis.game.documentTypes = originalDocumentTypes;
+}
+
+/**
+ * Embedded-children section gets the explicit "Common mistakes" callout
+ * forbidding `data.system.<X>` for embedded items. Targets the failure
+ * mode where small models invented `data.system.inventory` despite the
+ * skeleton showing `data.items`.
+ */
+function testEmbeddedChildrenCommonMistakesCallout() {
+  const service = schemaIndexService;
+  const originalCONFIG = globalThis.CONFIG;
+  globalThis.CONFIG = {
+    Actor: {
+      documentClass: {
+        hierarchy: { items: { metadata: { name: 'Item' } } },
+      },
+    },
+  };
+
+  const md = service._buildEmbeddedChildrenSection('Actor');
+  assert.ok(md, 'section emitted');
+  assert.match(md, /Common mistakes/, 'common-mistakes header present');
+  assert.match(md, /Do NOT.*data\.system/, 'forbids data.system nesting');
+  assert.match(md, /inventory/, 'explicitly names the invented field as a bad pattern');
 
   globalThis.CONFIG = originalCONFIG;
 }
@@ -509,7 +547,8 @@ testDeterminism();
 testStaticSnapshot();
 testCacheKeyDeterminism();
 testCommonLeafSurfacing();
-testEmbeddedChildrenPlaceholderInSkeleton();
+testEmbeddedChildrenStubInSkeleton();
+testEmbeddedChildrenCommonMistakesCallout();
 testInitialValueRendering();
 testFilterToolSchemasByIntent();
 testIntentDocTypeFilter();
