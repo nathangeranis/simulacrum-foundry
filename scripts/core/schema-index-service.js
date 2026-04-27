@@ -103,6 +103,135 @@ const COMMON_FIELDS_LIMIT = 10;
 // for dnd5e/pf2e where required-leaf chains are typically 2-3 deep.
 const MAX_RECURSION_STEPS = 3;
 
+// Field type → descriptive label for the Common Fields list. Bare type
+// names like "formula" or "html" don't tell a small model what shape to
+// emit; descriptive labels do. Falls back to the type name for anything
+// not in the map. Field-type keys here are the lower_snake_case names
+// produced by DocumentAPI.#getFieldTypeName (e.g. FormulaField → 'formula').
+const FIELD_TYPE_DESCRIPTIONS = {
+  string: 'string',
+  number: 'number',
+  numeric: 'number',
+  boolean: 'boolean',
+  integer: 'integer',
+  formula: "string (dice formula, e.g. '1d8+3')",
+  html: 'string (HTML content)',
+  file_path: 'string (file path)',
+  color: 'string (hex color)',
+  array: 'array',
+  set: 'array (unique values)',
+  object: 'object',
+  schema: 'object',
+  mapping: 'object (key-value map)',
+  identifier: 'string (slug identifier)',
+  document_id: 'string (document id)',
+  foreign_document: 'string (UUID reference to another document)',
+  source: 'object (source attribution)',
+};
+
+// Leaf field names that carry "common gameplay value" semantics in Foundry
+// data models — even when not strictly required, they're the fields a user
+// or LLM is most likely to want to set. Surfaced in the worked-JSON skeleton
+// so models bias toward the right field instead of an obscure required leaf
+// (e.g. `hp.formula` is required but `hp.value`/`hp.max` are what the model
+// should actually populate to set a creature's HP).
+const COMMON_LEAF_FIELDS = new Set(['value', 'max', 'min']);
+
+// Per-intent profiles for tool/template scoping. Mirrors the proxy's
+// INTENT_PROFILES dict. `tools` is a whitelist of tool names; '*' means
+// no whitelist (only the always-strip rules apply). `docTypes` is a
+// whitelist of top-level documentType prefixes; '*' means include all.
+// `ambiguous` is the fallback when classification cannot determine intent.
+const INTENT_PROFILES = {
+  create_actor: {
+    tools: new Set([
+      'create_document',
+      'update_document',
+      'search_documents',
+      'search_assets',
+      'manage_task',
+      'end_loop',
+    ]),
+    docTypes: new Set(['Actor', 'Item']),
+  },
+  create_item: {
+    tools: new Set(['create_document', 'search_documents', 'manage_task', 'end_loop']),
+    docTypes: new Set(['Item']),
+  },
+  create_journal: {
+    tools: new Set([
+      'create_document',
+      'search_documents',
+      'search_assets',
+      'manage_task',
+      'end_loop',
+    ]),
+    docTypes: new Set(['JournalEntry', 'JournalEntryPage']),
+  },
+  create_scene: {
+    tools: new Set([
+      'create_document',
+      'search_documents',
+      'search_assets',
+      'manage_task',
+      'end_loop',
+    ]),
+    docTypes: new Set(['Scene']),
+  },
+  create_other: {
+    tools: new Set(['create_document', 'search_documents', 'manage_task', 'end_loop']),
+    docTypes: '*',
+  },
+  modify: {
+    tools: new Set([
+      'read_document',
+      'update_document',
+      'search_documents',
+      'manage_task',
+      'end_loop',
+    ]),
+    docTypes: '*',
+  },
+  delete: {
+    tools: new Set([
+      'read_document',
+      'delete_document',
+      'search_documents',
+      'manage_task',
+      'end_loop',
+    ]),
+    docTypes: new Set(),
+  },
+  search_or_list: {
+    tools: new Set([
+      'search_documents',
+      'list_documents',
+      'read_document',
+      'manage_task',
+      'end_loop',
+    ]),
+    docTypes: new Set(),
+  },
+  execute_automation: {
+    tools: new Set([
+      'execute_macro',
+      'run_javascript',
+      'search_documents',
+      'manage_task',
+      'end_loop',
+    ]),
+    docTypes: new Set(),
+  },
+  asset_management: {
+    tools: new Set(['search_assets', 'browse_folders', 'manage_task', 'end_loop']),
+    docTypes: new Set(),
+  },
+  ambiguous: {
+    tools: '*',
+    docTypes: '*',
+  },
+};
+
 /**
  * Deterministic 32-bit FNV-1a hash. Used for the module-set component of the
  * cache key. Not cryptographic; we only need stable equality for "did the
@@ -140,11 +269,18 @@ const TYPE_EXAMPLE = {
  * trusts choice-derived defaults when the choices came from the field's
  * own declaration — fuzzy CONFIG-namespace lookups in DocumentAPI produce
  * false matches (e.g. `units: "turn"`, `type: "required"`) that would
- * mislead the model.
+ * mislead the model. Prefers `initial` value when present (DataModel
+ * convention: `initial` is the documented default and a safe placeholder).
  * @param {object} fieldInfo
  * @returns {string}
  */
 function formatExampleValue(fieldInfo) {
+  if (fieldInfo && Object.prototype.hasOwnProperty.call(fieldInfo, 'initial')) {
+    const init = fieldInfo.initial;
+    if (init === null || ['string', 'number', 'boolean'].includes(typeof init)) {
+      return JSON.stringify(init);
+    }
+  }
   const trusted =
     Array.isArray(fieldInfo?.choices) &&
     fieldInfo.choices.length > 0 &&
@@ -153,6 +289,16 @@ function formatExampleValue(fieldInfo) {
     return JSON.stringify(fieldInfo.choices[0]);
   }
   return TYPE_EXAMPLE[fieldInfo?.type] ?? '"<value>"';
+}
+
+/**
+ * Map a DocumentAPI field-type name to a descriptive label for display.
+ * @param {string|undefined} typeName
+ * @returns {string}
+ */
+function describeFieldType(typeName) {
+  if (!typeName) return 'unknown';
+  return FIELD_TYPE_DESCRIPTIONS[typeName] ?? typeName;
 }
 
 class SchemaIndexService {
@@ -757,26 +903,50 @@ class SchemaIndexService {
   }
 
   /**
-   * Recursively assemble a skeleton object containing only required leaves,
-   * up to MAX_RECURSION_STEPS levels deep. Returns null when nothing required is
-   * found at the current level (caller can omit the system block entirely).
+   * Recursively assemble a skeleton object containing required leaves (and
+   * "common gameplay" leaves under required parents), up to
+   * MAX_RECURSION_STEPS levels deep. Returns null when nothing qualifies at
+   * the current level (caller can omit the block entirely).
+   *
+   * The `parentRequired` flag lets us surface non-required leaves named
+   * `value`/`max`/`min` whenever they sit under a required SchemaField —
+   * the canonical Foundry pattern (e.g. `attributes.hp.value/max` are both
+   * non-required in dnd5e but are the actual mechanical fields users want
+   * to set; only `formula` is strictly required). Without this surface,
+   * small models faithfully populate only `formula` and leave HP at 0.
    *
    * @param {object|undefined} fieldDetails
    * @param {number} depth
+   * @param {boolean} parentRequired - whether the current level sits inside
+   *   a required SchemaField (controls the common-leaf surface)
    * @returns {Record<string, string|object>|null}
    */
-  _buildSystemSkeleton(fieldDetails, depth) {
+  _buildSystemSkeleton(fieldDetails, depth, parentRequired = false) {
     if (!fieldDetails || typeof fieldDetails !== 'object') return null;
     if (depth >= MAX_RECURSION_STEPS) return null;
 
     const out = {};
     for (const [name, info] of Object.entries(fieldDetails)) {
-      if (this._shouldSkipSchemaField(name, info)) continue;
-      if (!info.required) continue;
+      if (!this._fieldQualifiesForSkeleton(name, info, parentRequired)) continue;
       const value = this._renderSkeletonField(info, depth);
       if (value !== undefined) out[name] = value;
     }
     return Object.keys(out).length > 0 ? out : null;
+  }
+
+  /**
+   * Whether a field should be emitted into the JSON skeleton: must not be
+   * skipped, must be either required or qualify as a common-leaf under a
+   * required parent.
+   * @param {string} name
+   * @param {object} info
+   * @param {boolean} parentRequired
+   * @returns {boolean}
+   */
+  _fieldQualifiesForSkeleton(name, info, parentRequired) {
+    if (this._shouldSkipSchemaField(name, info)) return false;
+    if (info.required) return true;
+    return parentRequired && COMMON_LEAF_FIELDS.has(name) && !info.nested && !info.isCollection;
   }
 
   /**
@@ -795,13 +965,17 @@ class SchemaIndexService {
   /**
    * Render a single field as a skeleton value: recurse into nested SchemaFields,
    * or emit a primitive example. Returns undefined to signal "skip this field."
+   * Recursion passes `parentRequired=true` because we only call this for
+   * fields that themselves qualified for emission (required, or common-leaf
+   * under a required parent).
+   *
    * @param {object} info
    * @param {number} depth
    * @returns {string|object|undefined}
    */
   _renderSkeletonField(info, depth) {
     if (info.nested && typeof info.nested === 'object') {
-      const nested = this._buildSystemSkeleton(info.nested, depth + 1);
+      const nested = this._buildSystemSkeleton(info.nested, depth + 1, true);
       if (nested && Object.keys(nested).length > 0) return nested;
       return undefined;
     }
@@ -892,13 +1066,22 @@ class SchemaIndexService {
    * Format a single field as a markdown bullet line. Annotates DataModel-
    * class types as (complex) so the model knows it can't construct them
    * inline. Shows choices when displayable (trusted source or whitelisted).
+   * Surfaces `initial` value when the field declares one — matches the
+   * proxy's "default 'X'" annotation that helps models pick safe values.
    */
   _formatFieldLine(name, info) {
     const typeName = info.type || 'unknown';
     const isComplex = COMPLEX_FIELD_TYPES.has(typeName);
-    const typeLabel = isComplex ? `${typeName}; complex, use inspect_document_schema` : typeName;
+    const baseLabel = describeFieldType(typeName);
+    const typeLabel = isComplex ? `${baseLabel}; complex, use inspect_document_schema` : baseLabel;
     const parts = [`- \`system.${name}\` (${typeLabel})`];
     if (info.required) parts.push('**required**');
+    if (info && Object.prototype.hasOwnProperty.call(info, 'initial')) {
+      const init = info.initial;
+      if (init === null || ['string', 'number', 'boolean'].includes(typeof init)) {
+        parts.push(`default ${JSON.stringify(init)}`);
+      }
+    }
     if (this._hasDisplayableChoices(name, info)) {
       const sample = info.choices
         .slice(0, 5)
@@ -931,7 +1114,14 @@ class SchemaIndexService {
   }
 
   /**
-   * Build the preamble shared content. Explains create_document call shape.
+   * Build the preamble shared content. Anchors the model on the two-layer
+   * (top-level vs system) document structure with a worked example,
+   * because small models given only a structural skeleton tend to flatten
+   * `system.*` fields up under `data` (the failure mode that spawned this
+   * section). Common-mistakes pedagogy is empirically load-bearing — the
+   * proxy variant of this content was a measured contributor to the
+   * 110/100 result.
+   *
    * @param {string[]} documentTypes
    * @returns {string}
    */
@@ -944,20 +1134,72 @@ class SchemaIndexService {
       'When CREATING new documents, construct payloads directly from the entries below.',
       'Use `read_document` only on existing documents you intend to MODIFY or DELETE.',
       '',
-      '### Calling create_document',
+      '### Document structure',
       '',
-      'Every `create_document` call requires:',
-      '- `documentType` — top-level type from this list: ' + typesSummary,
-      '- `data.name` — string, the document name',
-      '- `data.type` — subtype (e.g. `"npc"`, `"weapon"`); see per-template entries below',
-      '- `data.system.*` — system-specific fields, see per-template entries',
+      'Every document has two layers of fields:',
+      '- **Top-level document fields** — shared across all documents of a class (e.g. all Actors have `name`, `type`, `img`, `items`, `effects`, `folder`, `sort`, `ownership`, `flags`).',
+      '- **System-specific fields** — specific to the subtype, nested under `data.system.*`.',
       '',
-      'For document types not covered below, fall back to `inspect_document_schema(documentType, subtype)`.',
+      '### Required for every `create_document` call',
+      '',
+      `- \`documentType\` — top-level document class (one of: ${typesSummary})`,
+      '- `data.name` — human-readable name (string, REQUIRED)',
+      '- `data.type` — subtype discriminator (REQUIRED for typed documents — e.g. `"npc"` for Actor, `"weapon"` for Item)',
+      '- `data.system` — object containing subtype-specific fields (see template-specific schemas below)',
+      '',
+      '### Common mistakes to avoid',
+      '',
+      '- **Do NOT** put system fields at the top level of `data`. They go under `data.system.*`.',
+      '- **Do NOT** omit `data.type` — Foundry will reject the document with `UNKNOWN_DOCUMENT_TYPE`.',
+      '- **Do NOT** include fields like `attributes` or `traits` directly under `data` — those belong under `data.system`.',
+      '- **Do NOT** create embedded documents (e.g. an Item belonging to an Actor) as standalone — embed them via the parent\'s top-level array (see per-document-type "Embedded children" sections).',
+      '',
+      this._buildPreambleWorkedExample(),
+      '',
+      'For document types not covered by per-template entries below, fall back to `inspect_document_schema(documentType, subtype)`.',
     ].join('\n');
   }
 
   /**
-   * Build the UUID format reference content, with live world ID and pack list.
+   * Worked-example block emitted inside the preamble. Extracted to keep
+   * `_buildPreamble` under the per-function line cap. Shows the canonical
+   * shape: `data.system.*` for system fields, `data.items[]` for embedded
+   * children, and the value/max HP convention.
+   * @returns {string}
+   */
+  _buildPreambleWorkedExample() {
+    return [
+      '### Worked example (Actor with embedded weapon)',
+      '',
+      '```json',
+      '{',
+      '  "documentType": "Actor",',
+      '  "data": {',
+      '    "name": "Goblin Warrior",',
+      '    "type": "npc",',
+      '    "system": {',
+      '      "attributes": {',
+      '        "hp": { "value": 15, "max": 15 },',
+      '        "ac": { "value": 13 }',
+      '      }',
+      '    },',
+      '    "items": [',
+      '      { "name": "Rusty Shortsword", "type": "weapon" }',
+      '    ]',
+      '  }',
+      '}',
+      '```',
+      '',
+      'Note how `attributes` is nested under `data.system`, NOT directly under `data`. The `items` array is a TOP-LEVEL field on the Actor `data` object — embedded children (Items inside an Actor, Pages inside a JournalEntry) DO NOT go under `data.system`.',
+    ].join('\n');
+  }
+
+  /**
+   * Build the UUID format reference content, with live world ID and pack
+   * list. Includes a DOCUMENT_NOT_FOUND troubleshooting note — small models
+   * often default to world UUID format for compendium documents, then
+   * fail their `read_document` call and stall.
+   *
    * @returns {string}
    */
   _buildUuidFormat() {
@@ -975,19 +1217,26 @@ class SchemaIndexService {
     return [
       '## UUID Format Conventions',
       '',
-      'Foundry documents are referenced by UUID. The format depends on where the document lives.',
+      'Foundry uses `@UUID[...]` syntax for cross-document references. The format depends on where the document lives.',
+      '',
+      '### Format by location',
       '',
       '**World documents (in this world):**',
-      '`@UUID[<DocType>.<id>]` or `@UUID[<DocType>.<id>]{Display Name}`',
-      `Example: \`@UUID[Actor.abc123]\` (world: ${worldId})`,
+      '`@UUID[<DocType>.<id>]{Display Name}`',
+      `Example: \`@UUID[Actor.BtDHCHehjqLjmMpV]{Grunk}\` (world id: ${worldId})`,
       '',
       '**Compendium documents (in a pack):**',
-      '`@UUID[Compendium.<scope>.<pack>.<DocType>.<id>]`',
-      'Example: `@UUID[Compendium.dnd5e.heroes.Actor.xyz789]{Hero Name}`',
+      '`@UUID[Compendium.<scope>.<pack>.<DocType>.<id>]{Display Name}`',
+      'Example: `@UUID[Compendium.dnd5e.actors24.Actor.mmGoblinWarrior0]{Goblin Warrior}`',
+      'The full prefix `Compendium.<scope>.<pack>` is REQUIRED for compendium references.',
       '',
-      '**Embedded documents (Items inside an Actor, Pages inside a Journal):**',
-      '`@UUID[<ParentType>.<parentId>.<EmbeddedType>.<embeddedId>]`',
-      'Example: `@UUID[Actor.abc123.Item.def456]`',
+      '**Embedded documents (Items inside an Actor, Pages inside a JournalEntry):**',
+      '`@UUID[<ParentType>.<parentId>.<ChildType>.<childId>]{Display Name}`',
+      'Example: `@UUID[Actor.BtDHCHehjqLjmMpV.Item.someWeaponId]{Shortsword}`',
+      '',
+      '### When `read_document` returns DOCUMENT_NOT_FOUND',
+      '',
+      'The most common cause is using world UUID format for a compendium document. Check your search results: if the result was returned from a compendium pack, you need the full `Compendium.<scope>.<pack>.` prefix when reading it.',
       '',
       'Available compendium pack scopes in this world:',
       packsSample,
@@ -1016,8 +1265,15 @@ class SchemaIndexService {
 
   /**
    * Per-DocType "Embedded children" section, emitted only when the document
-   * class declares an embedded hierarchy. Skips the boilerplate top-level
-   * fields list (now shared).
+   * class declares an embedded hierarchy. Walks `documentClass.hierarchy`
+   * to derive the array field name + child document type, then emits a
+   * worked-JSON example showing the parent-creation embedding pattern.
+   * This is empirically load-bearing — small models given only structural
+   * schemas tend to issue separate create_document calls for embedded
+   * children, which Foundry rejects (e.g. `documentType="JournalEntryPage"`
+   * with no parent fails because pages exist only as children of
+   * JournalEntry).
+   *
    * @param {string} documentType
    * @returns {string|null}
    */
@@ -1028,22 +1284,84 @@ class SchemaIndexService {
     const hierarchy = documentClass.hierarchy;
     if (!hierarchy || Object.keys(hierarchy).length === 0) return null;
 
-    const embeddedNames = Object.keys(hierarchy);
-    return [
-      `## ${documentType} — Embedded children`,
-      '',
-      `${documentType} contains embedded documents of these types: ${embeddedNames.join(', ')}.`,
-      `These are NOT created as standalone documents — they exist only as children of a ${documentType}.`,
-    ].join('\n');
+    const fields = Object.entries(hierarchy)
+      .map(([fieldName, fieldDef]) => ({
+        fieldName,
+        childType: this._extractEmbeddedChildType(fieldDef) ?? fieldName,
+      }))
+      .filter(f => f.fieldName && f.childType);
+
+    if (fields.length === 0) return null;
+
+    const lines = [`## ${documentType} — Embedded children`, ''];
+
+    lines.push(`A \`${documentType}\` contains embedded child documents:`);
+    for (const { fieldName, childType } of fields) {
+      lines.push(`- \`data.${fieldName}\` — array of \`${childType}\` create-payloads`);
+    }
+    lines.push('');
+    lines.push(
+      'These embedded children are NOT created as standalone documents. To create them, populate the array on the parent at `create_document` time — each entry is a full create-payload (with its own `name`, `type`, `system`, etc.). Modifying an existing parent uses `update_document` with the same array shape.'
+    );
+
+    const exampleField = fields[0];
+    lines.push('', `### Example: ${documentType} with embedded ${exampleField.childType}`, '');
+    lines.push('```json');
+    lines.push('{');
+    lines.push(`  "documentType": ${JSON.stringify(documentType)},`);
+    lines.push('  "data": {');
+    lines.push('    "name": "<string>",');
+    lines.push(`    ${JSON.stringify(exampleField.fieldName)}: [`);
+    lines.push(
+      `      { "name": "<child name>", "type": "<${exampleField.childType.toLowerCase()} subtype>" }`
+    );
+    lines.push('    ]');
+    lines.push('  }');
+    lines.push('}');
+    lines.push('```');
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Extract the embedded child documentType from a `documentClass.hierarchy`
+   * entry. Foundry V13 entries look roughly like
+   * `{ documentClass: <ClassRef>, ... }` or have a `model.metadata.name`
+   * pointer to the child type. Returns null when neither is decipherable —
+   * caller falls back to the field name.
+   * @param {object} fieldDef
+   * @returns {string|null}
+   */
+  _extractEmbeddedChildType(fieldDef) {
+    if (!fieldDef || typeof fieldDef !== 'object') return null;
+    const candidates = [
+      fieldDef?.model?.metadata?.name,
+      fieldDef?.element?.metadata?.name,
+      fieldDef?.documentClass?.metadata?.name,
+      fieldDef?.documentClass?.name,
+      fieldDef?.metadata?.name,
+    ];
+    for (const c of candidates) {
+      if (typeof c === 'string' && c.length > 0) return c;
+    }
+    return null;
   }
 
   /**
    * Get the compiled prompt string ready to inject. Concatenates preamble,
    * UUID format, all per-DocType fields content, and all per-template entries
    * in a deterministic order.
+   *
+   * When `intent` is provided AND the corresponding INTENT_PROFILES entry
+   * has a non-`*` `docTypes` set, per-DocType doc_fields and per-template
+   * entries are filtered to that set. Preamble + UUID format are always
+   * included so the model has the structural rules even if no template
+   * scoping applies.
+   *
+   * @param {string|null|undefined} intent - intent key from INTENT_PROFILES
    * @returns {Promise<string>}
    */
-  async getCompiledPrompt() {
+  async getCompiledPrompt(intent = null) {
     if (this._initialIndexPromise && !this._initialIndexComplete) {
       await this._initialIndexPromise;
     }
@@ -1053,6 +1371,8 @@ class SchemaIndexService {
       this._readAll('shared'),
       this._readAll('templates'),
     ]);
+
+    const docTypeFilter = this._intentDocTypeFilter(intent);
 
     const sections = [];
     const sharedByKey = new Map(shared.map(s => [s.key, s]));
@@ -1067,13 +1387,57 @@ class SchemaIndexService {
 
     const docFields = shared
       .filter(s => s.key.startsWith('doc_fields::'))
+      .filter(s => this._docFieldMatchesIntent(s.key, docTypeFilter))
       .sort((a, b) => a.key.localeCompare(b.key));
     for (const df of docFields) sections.push(df.content);
 
-    const sortedTemplates = templates.slice().sort((a, b) => a.id.localeCompare(b.id));
+    const sortedTemplates = templates
+      .slice()
+      .filter(t => this._templateMatchesIntent(t, docTypeFilter))
+      .sort((a, b) => a.id.localeCompare(b.id));
     for (const t of sortedTemplates) sections.push(t.content);
 
     return sections.join('\n\n');
+  }
+
+  /**
+   * Resolve the docTypes filter for a given intent. Returns `null` to
+   * signal "no filtering" (include everything) and an empty Set to signal
+   * "include nothing" (intent like `delete` or `search_or_list` that
+   * needs no per-template content).
+   * @param {string|null|undefined} intent
+   * @returns {Set<string>|null}
+   */
+  _intentDocTypeFilter(intent) {
+    if (!intent || !INTENT_PROFILES[intent]) return null;
+    const docTypes = INTENT_PROFILES[intent].docTypes;
+    if (docTypes === '*') return null;
+    return docTypes;
+  }
+
+  /**
+   * Whether a per-DocType `doc_fields::<DocType>` shared entry should be
+   * included given the intent filter. Null filter = include everything.
+   * Empty filter = include nothing.
+   * @param {string} key
+   * @param {Set<string>|null} filter
+   * @returns {boolean}
+   */
+  _docFieldMatchesIntent(key, filter) {
+    if (filter === null) return true;
+    const docType = key.replace(/^doc_fields::/, '');
+    return filter.has(docType);
+  }
+
+  /**
+   * Whether a per-template entry should be included given the intent filter.
+   * @param {{documentType: string}} template
+   * @param {Set<string>|null} filter
+   * @returns {boolean}
+   */
+  _templateMatchesIntent(template, filter) {
+    if (filter === null) return true;
+    return filter.has(template.documentType);
   }
 
   /**
@@ -1133,17 +1497,45 @@ class SchemaIndexService {
    * is on AND the index has compiled content available to inject, strip the
    * schema-discovery tools (inspect_document_schema, list_document_schemas)
    * — they're redundant and small models trip over their paginated output.
-   * Otherwise pass through unchanged.
+   *
+   * When `intent` is provided AND the corresponding INTENT_PROFILES entry
+   * has a non-`*` `tools` whitelist, the tool list is further restricted
+   * to that whitelist. The schema-discovery strip remains in effect even
+   * when the whitelist would otherwise admit them — those tools are
+   * always wrong in this mode.
+   *
    * @param {Array<{function?: {name: string}}>} schemas - tool schemas as
    *   produced by toolRegistry.getToolSchemas()
+   * @param {string|null|undefined} intent - intent key from INTENT_PROFILES
    * @returns {Array} filtered (or original) schemas
    */
-  filterToolSchemas(schemas) {
+  filterToolSchemas(schemas, intent = null) {
     if (!Array.isArray(schemas)) return schemas;
     if (!this._readSmallModelMode()) return schemas;
     if (!this.isReady()) return schemas;
     if (this._templateCount === 0) return schemas;
-    return schemas.filter(s => !SCHEMA_DISCOVERY_TOOL_NAMES.has(s?.function?.name));
+
+    const allowList = this._intentToolAllowList(intent);
+
+    return schemas.filter(s => {
+      const name = s?.function?.name;
+      if (SCHEMA_DISCOVERY_TOOL_NAMES.has(name)) return false;
+      if (allowList && !allowList.has(name)) return false;
+      return true;
+    });
+  }
+
+  /**
+   * Resolve the per-intent tool whitelist. Returns `null` for "no
+   * whitelist" (only the always-strip schema-discovery rule applies).
+   * @param {string|null|undefined} intent
+   * @returns {Set<string>|null}
+   */
+  _intentToolAllowList(intent) {
+    if (!intent || !INTENT_PROFILES[intent]) return null;
+    const tools = INTENT_PROFILES[intent].tools;
+    if (tools === '*') return null;
+    return tools;
   }
 
   /**

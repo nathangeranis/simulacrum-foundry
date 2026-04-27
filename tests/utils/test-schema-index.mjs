@@ -238,6 +238,216 @@ function testCacheKeyDeterminism() {
   assert.notEqual(k1, k4, 'inactive modules should not contribute to hash');
 }
 
+/**
+ * Common-leaf heuristic: when a SchemaField is required, also surface its
+ * `value`/`max`/`min` children even if they're not strictly required. This
+ * matches dnd5e-style schemas where `hp.formula` is required but the
+ * gameplay-relevant fields are `hp.value` and `hp.max`. Without this
+ * surface, small models populate only the required leaf and leave HP at 0.
+ */
+function testCommonLeafSurfacing() {
+  const service = schemaIndexService;
+  const fixture = {
+    type: 'Actor',
+    subtype: 'npc',
+    fields: ['name', 'type', 'system'],
+    fieldDetails: {
+      name: { type: 'string', required: true },
+      type: { type: 'string', required: true },
+    },
+    systemFields: ['attributes'],
+    systemFieldDetails: {
+      attributes: {
+        type: 'schema',
+        required: true,
+        nested: {
+          hp: {
+            type: 'schema',
+            required: true,
+            nested: {
+              formula: { type: 'formula', required: true },
+              value: { type: 'number', required: false },
+              max: { type: 'number', required: false },
+              dt: { type: 'number', required: false },
+            },
+          },
+        },
+      },
+    },
+  };
+  const md = service._buildTemplateEntryFromSchema('Actor', 'npc', fixture);
+  const jsonMatch = md.match(/```json\n([\s\S]*?)\n```/);
+  assert.ok(jsonMatch);
+  const jsonText = jsonMatch[1];
+  assert.match(jsonText, /"value":/, 'value should be surfaced under required hp');
+  assert.match(jsonText, /"max":/, 'max should be surfaced under required hp');
+  assert.match(jsonText, /"formula":/, 'required formula remains');
+  assert.equal(/"dt":/.test(jsonText), false, 'non-common non-required leaf should be omitted');
+}
+
+/**
+ * Initial values: when a field declares an `initial` default, prefer that
+ * over generic placeholders in the JSON skeleton AND surface it as a
+ * `default <value>` annotation in the Common Fields list.
+ */
+function testInitialValueRendering() {
+  const service = schemaIndexService;
+  const fixture = {
+    type: 'Item',
+    subtype: 'weapon',
+    fields: ['name', 'type'],
+    fieldDetails: { name: { type: 'string', required: true } },
+    systemFields: ['quantity'],
+    systemFieldDetails: {
+      quantity: { type: 'number', required: true, initial: 1 },
+    },
+  };
+  const md = service._buildTemplateEntryFromSchema('Item', 'weapon', fixture);
+  const jsonMatch = md.match(/```json\n([\s\S]*?)\n```/);
+  assert.match(jsonMatch[1], /"quantity": 1/, 'initial value used in skeleton');
+  assert.match(md, /default 1/, 'initial annotated in common fields');
+}
+
+/**
+ * Intent profiles: filterToolSchemas with a known intent should restrict
+ * the tool set to that intent's whitelist (plus stripping schema-discovery
+ * tools always).
+ */
+function testFilterToolSchemasByIntent() {
+  const service = schemaIndexService;
+
+  // Stub the gating preconditions so filterToolSchemas runs its full path.
+  const originalSettings = globalThis.game.settings;
+  globalThis.game.settings = {
+    get: (_module, key) => (key === 'smallModelMode' ? true : undefined),
+  };
+  service.db = service.db || {}; // any non-null sentinel
+  service._initialIndexComplete = true;
+  service._templateCount = 1;
+
+  const schemas = [
+    { type: 'function', function: { name: 'create_document' } },
+    { type: 'function', function: { name: 'delete_document' } },
+    { type: 'function', function: { name: 'inspect_document_schema' } },
+    { type: 'function', function: { name: 'manage_task' } },
+    { type: 'function', function: { name: 'end_loop' } },
+    { type: 'function', function: { name: 'execute_macro' } },
+    { type: 'function', function: { name: 'search_documents' } },
+    { type: 'function', function: { name: 'search_assets' } },
+  ];
+
+  const filteredCreate = service.filterToolSchemas(schemas, 'create_actor');
+  const namesCreate = filteredCreate.map(s => s.function.name).sort();
+  assert.deepEqual(
+    namesCreate,
+    ['create_document', 'end_loop', 'manage_task', 'search_assets', 'search_documents'],
+    'create_actor whitelist applied (no update_document available in test schemas)'
+  );
+  assert.equal(
+    namesCreate.includes('inspect_document_schema'),
+    false,
+    'schema-discovery still stripped under intent'
+  );
+
+  const filteredDelete = service.filterToolSchemas(schemas, 'delete');
+  const namesDelete = filteredDelete.map(s => s.function.name).sort();
+  assert.deepEqual(
+    namesDelete,
+    ['delete_document', 'end_loop', 'manage_task', 'search_documents'],
+    'delete intent restricts to delete_document family'
+  );
+
+  const filteredAmbiguous = service.filterToolSchemas(schemas, 'ambiguous');
+  assert.equal(
+    filteredAmbiguous.includes('inspect_document_schema'),
+    false,
+    'schema-discovery stripped under ambiguous'
+  );
+  assert.equal(
+    filteredAmbiguous.length,
+    7,
+    'ambiguous keeps all but schema-discovery (7 of 8 input schemas)'
+  );
+
+  // Restore globals
+  globalThis.game.settings = originalSettings;
+  service._initialIndexComplete = false;
+  service._templateCount = 0;
+  service.db = null;
+}
+
+/**
+ * Intent docTypes filter should drop per-DocType doc_fields and per-template
+ * entries that don't match the intent's docTypes set.
+ */
+function testIntentDocTypeFilter() {
+  const service = schemaIndexService;
+  const filterCreateActor = service._intentDocTypeFilter('create_actor');
+  assert.ok(filterCreateActor instanceof Set);
+  assert.equal(filterCreateActor.has('Actor'), true);
+  assert.equal(filterCreateActor.has('Item'), true);
+  assert.equal(filterCreateActor.has('JournalEntry'), false);
+
+  const filterCreateOther = service._intentDocTypeFilter('create_other');
+  assert.equal(filterCreateOther, null, "'*' resolves to null (no filter)");
+
+  const filterAmbiguous = service._intentDocTypeFilter('ambiguous');
+  assert.equal(filterAmbiguous, null, 'ambiguous applies no doc filter');
+
+  const filterUnknown = service._intentDocTypeFilter('not_a_real_intent');
+  assert.equal(filterUnknown, null, 'unknown intent applies no filter');
+
+  // Helpers
+  assert.equal(
+    service._docFieldMatchesIntent('doc_fields::Actor', filterCreateActor),
+    true,
+    'Actor doc_fields included for create_actor'
+  );
+  assert.equal(
+    service._docFieldMatchesIntent('doc_fields::Scene', filterCreateActor),
+    false,
+    'Scene doc_fields excluded for create_actor'
+  );
+
+  assert.equal(service._templateMatchesIntent({ documentType: 'Actor' }, filterCreateActor), true);
+  assert.equal(service._templateMatchesIntent({ documentType: 'Scene' }, filterCreateActor), false);
+}
+
+/**
+ * Sanity: every documented intent key behaves predictably through the
+ * public API. INTENT_PROFILES isn't exported (kept module-private to keep
+ * knip's surface clean), so we exercise the table indirectly via the
+ * filter helpers — same coverage, no extra exports.
+ */
+function testEveryIntentDispatchable() {
+  const service = schemaIndexService;
+  const documented = [
+    'create_actor',
+    'create_item',
+    'create_journal',
+    'create_scene',
+    'create_other',
+    'modify',
+    'delete',
+    'search_or_list',
+    'execute_automation',
+    'asset_management',
+    'ambiguous',
+  ];
+  for (const intent of documented) {
+    const filter = service._intentDocTypeFilter(intent);
+    assert.ok(filter === null || filter instanceof Set, `${intent} resolves to a Set or null`);
+    const allowList = service._intentToolAllowList(intent);
+    assert.ok(
+      allowList === null || allowList instanceof Set,
+      `${intent} tool allow-list resolves to a Set or null`
+    );
+  }
+  // Unknown intent strings fall through to "no filter" (graceful degradation).
+  assert.equal(service._intentDocTypeFilter('totally_made_up'), null);
+  assert.equal(service._intentToolAllowList('totally_made_up'), null);
+}
+
 testHeadingAndDescription();
 testMinimumViableJsonSection();
 testCommonFieldsSection();
@@ -247,5 +457,10 @@ testBaseTemplate();
 testDeterminism();
 testStaticSnapshot();
 testCacheKeyDeterminism();
+testCommonLeafSurfacing();
+testInitialValueRendering();
+testFilterToolSchemasByIntent();
+testIntentDocTypeFilter();
+testEveryIntentDispatchable();
 
 console.log('schema-index tests passed');

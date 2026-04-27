@@ -66,9 +66,14 @@ export async function getAvailableMacrosList() {
 
 /**
  * Build the complete system prompt
+ * @param {object} [options]
+ * @param {string|null} [options.intent] - intent key from INTENT_PROFILES,
+ *   used to scope the injected schema content to relevant document types.
+ *   Null/missing leaves all template entries in (no scoping).
  * @returns {Promise<string>} The system prompt
  */
-export async function buildSystemPrompt() {
+export async function buildSystemPrompt(options = {}) {
+  const { intent = null } = options;
   const documentTypesInfo = getDocumentTypesInfo();
   const legacyMode = game?.settings?.get('simulacrum', 'legacyMode') || false;
   const smallModelMode = game?.settings?.get('simulacrum', 'smallModelMode') || false;
@@ -79,11 +84,12 @@ export async function buildSystemPrompt() {
 
   // Pre-compiled schema index — only injected under smallModelMode and only
   // when the index has content. Fetched once up-front so the i18n + assembly
-  // path stays synchronous.
+  // path stays synchronous. Intent-scoped: schema content is filtered to
+  // doc types relevant to the user's request.
   const schemaIndexAvailable =
     smallModelMode && !legacyMode && schemaIndexService.getAvailability().available;
   const compiledSchemaContent = schemaIndexAvailable
-    ? await schemaIndexService.getCompiledPrompt()
+    ? await schemaIndexService.getCompiledPrompt(intent)
     : '';
 
   let basePrompt;

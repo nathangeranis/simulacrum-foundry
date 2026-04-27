@@ -7,6 +7,7 @@ import { AIClient } from './ai-client.js';
 import { COMPACTION_STATUS, ConversationManager, MAX_COMPACTION_ROUNDS } from './conversation.js';
 import { toolRegistry } from './tool-registry.js';
 import { schemaIndexService } from './schema-index-service.js';
+import { classifyLatestUserMessage } from './intent-classifier.js';
 import { documentReadRegistry } from '../utils/document-read-registry.js';
 import { toolPermissionManager } from './tool-permission-manager.js';
 
@@ -191,13 +192,20 @@ class SimulacrumCore {
         }
       }
 
+      // Classify the latest user message into an intent — drives
+      // per-intent tool/schema scoping under smallModelMode. Heuristic-only;
+      // no extra LLM call. Falls back to 'ambiguous' (no scoping) when
+      // the message doesn't match any pattern.
+      const intent = classifyLatestUserMessage(messages);
+
       // Get available tools (use provided tools or default from registry).
       // Filter through schemaIndexService — strips schema-discovery tools
-      // when smallModelMode is on and the compiled schema index is ready.
+      // when smallModelMode is on and the compiled schema index is ready,
+      // and applies the per-intent tool whitelist.
       let tools =
         options.tools !== undefined
           ? options.tools
-          : schemaIndexService.filterToolSchemas(toolRegistry.getToolSchemas());
+          : schemaIndexService.filterToolSchemas(toolRegistry.getToolSchemas(), intent);
       // Diagnostics: log tool schemas sent (names only)
       try {
         if (isDebugEnabled()) {
@@ -233,12 +241,17 @@ class SimulacrumCore {
 
       // Get system prompt early so compaction can account for its token overhead
       const useCustomPrompt = !!options.systemPrompt;
-      let systemPrompt = options.systemPrompt || (await this.getSystemPrompt());
+      let systemPrompt = options.systemPrompt || (await this.getSystemPrompt(intent));
       const getSystemPromptFn = () => systemPrompt;
 
       // Trigger compaction if approaching token limit, looping until within budget
       if (this.conversationManager && this.aiClient) {
-        systemPrompt = await this._compactHistoryIfNeeded(systemPrompt, useCustomPrompt, options);
+        systemPrompt = await this._compactHistoryIfNeeded(
+          systemPrompt,
+          useCustomPrompt,
+          options,
+          intent
+        );
       }
 
       // Legacy capping removed in favor of Tiered Context Compaction
@@ -441,8 +454,8 @@ class SimulacrumCore {
     return getMacros();
   }
 
-  static async getSystemPrompt() {
-    let prompt = await buildSystemPrompt();
+  static async getSystemPrompt(intent = null) {
+    let prompt = await buildSystemPrompt({ intent });
     if (this.conversationManager?.rollingSummary) {
       prompt = `### PREVIOUS CONVERSATION SUMMARY\n${this.conversationManager.rollingSummary}\n### END OF SUMMARY\n\n${prompt}`;
     }
@@ -453,7 +466,7 @@ class SimulacrumCore {
     return this.conversationManager.estimatePromptOverhead(systemPrompt, includeRollingSummary);
   }
 
-  static async _compactHistoryIfNeeded(systemPrompt, useCustomPrompt, options) {
+  static async _compactHistoryIfNeeded(systemPrompt, useCustomPrompt, options, intent = null) {
     try {
       let rounds = 0;
       let anyCompacted = false;
@@ -470,7 +483,7 @@ class SimulacrumCore {
         if (compactionStatus === COMPACTION_STATUS.FAILED) break;
 
         anyCompacted = true;
-        systemPrompt = useCustomPrompt ? systemPrompt : await this.getSystemPrompt();
+        systemPrompt = useCustomPrompt ? systemPrompt : await this.getSystemPrompt(intent);
         promptOverhead = this._estimatePromptOverhead(systemPrompt, includeRollingSummary);
       }
 

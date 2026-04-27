@@ -204,8 +204,10 @@ class ChatHandler {
     const { SimulacrumCore } = await import('./simulacrum-core.js');
     const { toolRegistry } = await import('./tool-registry.js');
     const { schemaIndexService } = await import('./schema-index-service.js');
+    const { classifyLatestUserMessage } = await import('./intent-classifier.js');
 
-    const tools = schemaIndexService.filterToolSchemas(toolRegistry.getToolSchemas());
+    const intent = classifyLatestUserMessage(this.conversationManager.getMessages());
+    const tools = schemaIndexService.filterToolSchemas(toolRegistry.getToolSchemas(), intent);
     const legacyMode = game?.settings?.get('simulacrum', 'legacyMode') ?? false;
     const currentToolSupport = !legacyMode;
 
