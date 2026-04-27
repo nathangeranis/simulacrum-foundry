@@ -874,7 +874,13 @@ class SchemaIndexService {
 
   /**
    * Build the worked-example JSON block for create_document. Uses required
-   * leaves only, depth-capped at MAX_RECURSION_STEPS.
+   * leaves only, depth-capped at MAX_RECURSION_STEPS. Includes top-level
+   * placeholders for embedded-children arrays (e.g. `data.items` on Actor,
+   * `data.pages` on JournalEntry) so the model sees the right nesting
+   * position when copying the template — without these, small models
+   * faithfully fill out `data.system.*` and then nest items under
+   * `data.system.items` because the heavy section pulls everything in.
+   *
    * @param {string} documentType
    * @param {string|null} subtype
    * @param {object} schema
@@ -897,9 +903,28 @@ class SchemaIndexService {
       data.system = systemBlock;
     }
 
+    // Embedded children placeholders — anchors the model to the right
+    // nesting position. Empty `[]` keeps the skeleton minimal; the
+    // per-DocType "Embedded children" section shows the full payload shape.
+    for (const fieldName of this._embeddedFieldNames(documentType)) {
+      data[fieldName] = '[]';
+    }
+
     const dataBlock = this._renderJSONLike(data, 2);
     const wrapper = `{\n  "documentType": ${JSON.stringify(documentType)},\n  "data": ${dataBlock}\n}`;
     return '```json\n' + wrapper + '\n```';
+  }
+
+  /**
+   * Names of top-level embedded-children fields for a document type, derived
+   * from `documentClass.hierarchy`. Empty list when no hierarchy declared.
+   * @param {string} documentType
+   * @returns {string[]}
+   */
+  _embeddedFieldNames(documentType) {
+    const hierarchy = CONFIG?.[documentType]?.documentClass?.hierarchy;
+    if (!hierarchy) return [];
+    return Object.keys(hierarchy);
   }
 
   /**

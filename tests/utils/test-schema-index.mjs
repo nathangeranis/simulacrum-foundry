@@ -286,6 +286,57 @@ function testCommonLeafSurfacing() {
 }
 
 /**
+ * Embedded-children placeholder: when the documentClass declares an embedded
+ * hierarchy (Actor → items, JournalEntry → pages), the per-template JSON
+ * skeleton must include a top-level `[]` placeholder for each. Without
+ * this, models faithfully fill in `data.system.*` and then nest items
+ * under `data.system.items` because the system section pulls them in.
+ */
+function testEmbeddedChildrenPlaceholderInSkeleton() {
+  const service = schemaIndexService;
+  // Simulate Foundry's CONFIG.<DocType>.documentClass.hierarchy for Actor.
+  const originalCONFIG = globalThis.CONFIG;
+  globalThis.CONFIG = {
+    Actor: {
+      documentClass: {
+        hierarchy: { items: { metadata: { name: 'Item' } }, effects: {} },
+      },
+    },
+  };
+
+  const fixture = {
+    type: 'Actor',
+    subtype: 'npc',
+    fields: ['name', 'type', 'system'],
+    fieldDetails: { name: { type: 'string', required: true } },
+    systemFields: ['attributes'],
+    systemFieldDetails: {
+      attributes: {
+        type: 'schema',
+        required: true,
+        nested: { hp: { type: 'number', required: true } },
+      },
+    },
+  };
+  const md = service._buildTemplateEntryFromSchema('Actor', 'npc', fixture);
+  const jsonMatch = md.match(/```json\n([\s\S]*?)\n```/);
+  assert.ok(jsonMatch);
+  const jsonText = jsonMatch[1];
+  assert.match(jsonText, /"items": \[\]/, 'items placeholder present');
+  assert.match(jsonText, /"effects": \[\]/, 'effects placeholder present');
+
+  // Items must be at the SAME indent as `system` (i.e. a sibling under
+  // `data`), not nested inside the system block. Compare leading whitespace.
+  const systemIndent = jsonText.match(/^( +)"system":/m)?.[1];
+  const itemsIndent = jsonText.match(/^( +)"items":/m)?.[1];
+  assert.ok(systemIndent, 'system line found');
+  assert.ok(itemsIndent, 'items line found');
+  assert.equal(itemsIndent, systemIndent, 'items must be a sibling of system, not nested');
+
+  globalThis.CONFIG = originalCONFIG;
+}
+
+/**
  * Initial values: when a field declares an `initial` default, prefer that
  * over generic placeholders in the JSON skeleton AND surface it as a
  * `default <value>` annotation in the Common Fields list.
@@ -458,6 +509,7 @@ testDeterminism();
 testStaticSnapshot();
 testCacheKeyDeterminism();
 testCommonLeafSurfacing();
+testEmbeddedChildrenPlaceholderInSkeleton();
 testInitialValueRendering();
 testFilterToolSchemasByIntent();
 testIntentDocTypeFilter();
