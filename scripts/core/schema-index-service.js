@@ -42,6 +42,40 @@ const SKIP_FIELD_TYPES = new Set([
 // Top-level field names to skip in markdown emission (Foundry housekeeping).
 const SKIP_FIELD_NAMES = new Set(['_stats', 'flags', '_id', 'ownership', 'sort']);
 
+// Document types that aren't user-creatable in the sense small models care
+// about. Excluding them avoids the model trying to e.g. `create_document` a
+// User account or a runtime FogExploration record. PR4's intent-driven
+// filtering would generalize this.
+const NON_CREATABLE_DOCUMENT_TYPES = new Set([
+  'User',
+  'Setting',
+  'FogExploration',
+  'Combat',
+  'ChatMessage',
+  'Folder',
+]);
+
+// DataModel-class field types that aren't primitives — emitted by
+// DocumentAPI as the class name (e.g. 'activities', 'advancement_collection').
+// In Common Fields we mark these as complex so the model knows not to
+// invent a structure.
+const COMPLEX_FIELD_TYPES = new Set([
+  'activities',
+  'activity',
+  'activation',
+  'advancement_collection',
+  'actor_deltas',
+  'creature_type',
+  'duration',
+  'formula',
+  'identifier',
+  'item_type',
+  'movement',
+  'senses',
+  'source',
+  'spellcasting',
+]);
+
 // Cap on common fields shown in the worked example / common-fields list.
 const COMMON_FIELDS_LIMIT = 10;
 // Maximum recursion steps when walking nested SchemaFields. The first call
@@ -83,12 +117,20 @@ const TYPE_EXAMPLE = {
 };
 
 /**
- * Format a JSON value compactly for inclusion in worked examples.
+ * Format a JSON value compactly for inclusion in worked examples. Only
+ * trusts choice-derived defaults when the choices came from the field's
+ * own declaration — fuzzy CONFIG-namespace lookups in DocumentAPI produce
+ * false matches (e.g. `units: "turn"`, `type: "required"`) that would
+ * mislead the model.
  * @param {object} fieldInfo
  * @returns {string}
  */
 function formatExampleValue(fieldInfo) {
-  if (Array.isArray(fieldInfo?.choices) && fieldInfo.choices.length > 0) {
+  const trusted =
+    Array.isArray(fieldInfo?.choices) &&
+    fieldInfo.choices.length > 0 &&
+    fieldInfo.choicesSource !== 'CONFIG';
+  if (trusted) {
     return JSON.stringify(fieldInfo.choices[0]);
   }
   return TYPE_EXAMPLE[fieldInfo?.type] ?? '"<value>"';
@@ -351,53 +393,76 @@ class SchemaIndexService {
    * @returns {{templates: object[], shared: object[]}}
    */
   _buildAllContent(documentTypes, generatedAt) {
+    const creatableTypes = documentTypes.filter(t => !NON_CREATABLE_DOCUMENT_TYPES.has(t));
+
     const templates = [];
     const shared = [];
 
-    for (const documentType of documentTypes) {
+    for (const documentType of creatableTypes) {
       try {
         this._collectTemplatesForType(documentType, generatedAt, templates);
-        const docFieldsContent = this._buildDocumentFieldsContent(documentType);
-        if (docFieldsContent) {
-          shared.push({
-            key: `doc_fields::${documentType}`,
-            content: docFieldsContent,
-            generatedAt,
-          });
-        }
       } catch (err) {
         this.logger.warn(`Failed to build entry for ${documentType}: ${err.message}`);
       }
     }
 
-    shared.push({ key: 'preamble', content: this._buildPreamble(documentTypes), generatedAt });
+    // One shared "Standard top-level fields" block, plus per-DocType
+    // embedded-children sections only when present.
+    shared.push({
+      key: 'preamble',
+      content: this._buildPreamble(creatableTypes),
+      generatedAt,
+    });
     shared.push({ key: 'uuid_format', content: this._buildUuidFormat(), generatedAt });
+    shared.push({
+      key: 'top_level_fields',
+      content: this._buildTopLevelFieldsSection(),
+      generatedAt,
+    });
+
+    for (const documentType of creatableTypes) {
+      const embeddedContent = this._buildEmbeddedChildrenSection(documentType);
+      if (embeddedContent) {
+        shared.push({
+          key: `doc_fields::${documentType}`,
+          content: embeddedContent,
+          generatedAt,
+        });
+      }
+    }
 
     return { templates, shared };
   }
 
   /**
    * Push base + per-subtype template entries for a document type.
+   *
+   * Drops the (base) entry when:
+   *   - the type has subtypes (real types use subtype entries)
+   *   - the base entry has no system data to show (pure boilerplate)
+   *
    * @param {string} documentType
    * @param {number} generatedAt
    * @param {object[]} templates - mutated in place
    */
   _collectTemplatesForType(documentType, generatedAt, templates) {
-    const baseEntry = this._buildTemplateEntry(documentType, null);
-    if (baseEntry) {
-      templates.push({
-        id: `${documentType}::_base`,
-        documentType,
-        subtype: null,
-        content: baseEntry,
-        generatedAt,
-      });
+    const subtypes = (game?.documentTypes?.[documentType] ?? []).filter(s => s !== 'base');
+
+    if (subtypes.length === 0) {
+      // No subtypes: emit base entry only if it has system content
+      const baseEntry = this._buildTemplateEntry(documentType, null);
+      if (baseEntry && this._entryHasSystemContent(baseEntry)) {
+        templates.push({
+          id: `${documentType}::_base`,
+          documentType,
+          subtype: null,
+          content: baseEntry,
+          generatedAt,
+        });
+      }
     }
 
-    const subtypes = game?.documentTypes?.[documentType] ?? [];
     for (const subtype of subtypes) {
-      // Skip the synthetic 'base' subtype that some systems register
-      if (subtype === 'base') continue;
       const entry = this._buildTemplateEntry(documentType, subtype);
       if (entry) {
         templates.push({
@@ -409,6 +474,18 @@ class SchemaIndexService {
         });
       }
     }
+  }
+
+  /**
+   * Whether a generated template entry contains any system data — i.e.
+   * something more than the bare minimum-viable JSON skeleton with just
+   * name and (optionally) img/type. Used to drop pure-boilerplate base
+   * entries.
+   * @param {string} entry
+   * @returns {boolean}
+   */
+  _entryHasSystemContent(entry) {
+    return entry.includes('"system"') || entry.includes('### Common system.* fields');
   }
 
   /**
@@ -511,8 +588,8 @@ class SchemaIndexService {
     const heading = subtype ? `## ${documentType} (${subtype})` : `## ${documentType} (base)`;
     const description = this._describeTemplate(documentType, subtype);
     const minimalJson = this._buildMinimalJSON(documentType, subtype, schema);
-    const commonFields = this._formatCommonFields(schema);
-    const advancedFields = this._formatAdvancedFields(schema);
+    const common = this._formatCommonFields(schema);
+    const advancedFields = this._formatAdvancedFields(schema, common.names);
 
     const sections = [
       heading,
@@ -522,8 +599,8 @@ class SchemaIndexService {
       minimalJson,
     ];
 
-    if (commonFields) {
-      sections.push('', '### Common system.* fields', commonFields);
+    if (common.markdown) {
+      sections.push('', '### Common system.* fields', common.markdown);
     }
     if (advancedFields) {
       sections.push(
@@ -674,11 +751,13 @@ class SchemaIndexService {
    * COMMON_FIELDS_LIMIT fields, required first, then non-required ranked by
    * presence of choices / hint.
    * @param {object} schema
-   * @returns {string|null}
+   * @returns {{markdown: string|null, names: Set<string>}}
    */
   _formatCommonFields(schema) {
     const details = schema.systemFieldDetails;
-    if (!details || typeof details !== 'object' || details.$ref) return null;
+    if (!details || typeof details !== 'object' || details.$ref) {
+      return { markdown: null, names: new Set() };
+    }
 
     const candidates = [];
     for (const [name, info] of Object.entries(details)) {
@@ -690,25 +769,46 @@ class SchemaIndexService {
       const aReq = a.info.required ? 1 : 0;
       const bReq = b.info.required ? 1 : 0;
       if (aReq !== bReq) return bReq - aReq;
-      const aHas = a.info.choices ? 1 : 0;
-      const bHas = b.info.choices ? 1 : 0;
+      const aHas = this._hasTrustedChoices(a.info) ? 1 : 0;
+      const bHas = this._hasTrustedChoices(b.info) ? 1 : 0;
       if (aHas !== bHas) return bHas - aHas;
       return a.name.localeCompare(b.name);
     });
 
     const top = candidates.slice(0, COMMON_FIELDS_LIMIT);
-    if (top.length === 0) return null;
+    if (top.length === 0) return { markdown: null, names: new Set() };
 
-    return top.map(({ name, info }) => this._formatFieldLine(name, info)).join('\n');
+    const names = new Set(top.map(({ name }) => name));
+    const markdown = top.map(({ name, info }) => this._formatFieldLine(name, info)).join('\n');
+    return { markdown, names };
   }
 
   /**
-   * Format a single field as a markdown bullet line.
+   * Whether `info.choices` came from the field's own `choices` declaration
+   * (trusted) rather than the fuzzy CONFIG namespace lookup in
+   * DocumentAPI.#lookupConfigChoices (untrusted — produces false matches
+   * like "type: required" or "units: turn").
+   * @param {object} info
+   * @returns {boolean}
+   */
+  _hasTrustedChoices(info) {
+    return (
+      Array.isArray(info?.choices) && info.choices.length > 0 && info.choicesSource !== 'CONFIG'
+    );
+  }
+
+  /**
+   * Format a single field as a markdown bullet line. Annotates DataModel-
+   * class types as (complex) so the model knows it can't construct them
+   * inline. Skips choices that came from fuzzy CONFIG matching.
    */
   _formatFieldLine(name, info) {
-    const parts = [`- \`system.${name}\` (${info.type || 'unknown'})`];
+    const typeName = info.type || 'unknown';
+    const isComplex = COMPLEX_FIELD_TYPES.has(typeName);
+    const typeLabel = isComplex ? `${typeName}; complex, use inspect_document_schema` : typeName;
+    const parts = [`- \`system.${name}\` (${typeLabel})`];
     if (info.required) parts.push('**required**');
-    if (Array.isArray(info.choices) && info.choices.length > 0) {
+    if (this._hasTrustedChoices(info)) {
       const sample = info.choices
         .slice(0, 5)
         .map(c => `\`${c}\``)
@@ -719,27 +819,23 @@ class SchemaIndexService {
   }
 
   /**
-   * Format the "Advanced fields" list - terse names only.
+   * Format the "Advanced fields" list — strictly fields NOT already shown
+   * in Common Fields. Terse names only.
    * @param {object} schema
+   * @param {Set<string>} commonNames - field names already emitted in Common
    * @returns {string|null}
    */
-  _formatAdvancedFields(schema) {
+  _formatAdvancedFields(schema, commonNames) {
     const details = schema.systemFieldDetails;
     if (!details || typeof details !== 'object' || details.$ref) return null;
 
-    const allNames = Object.keys(details).filter(
-      name => !this._shouldSkipSchemaField(name, details[name])
-    );
+    const remainder = Object.keys(details)
+      .filter(name => !this._shouldSkipSchemaField(name, details[name]))
+      .filter(name => !commonNames.has(name))
+      .sort();
 
-    if (allNames.length === 0) return null;
+    if (remainder.length === 0) return null;
 
-    // Subtract the COMMON_FIELDS_LIMIT we'll emit in the common-fields block.
-    // For simplicity, emit the full list here — the common block already
-    // shows the top ones, so listing all names here is redundant but cheap.
-    // Skip if there's nothing beyond what's covered by common fields.
-    if (allNames.length <= COMMON_FIELDS_LIMIT) return null;
-
-    const remainder = allNames.sort();
     return remainder.map(n => `\`system.${n}\``).join(', ');
   }
 
@@ -808,37 +904,46 @@ class SchemaIndexService {
   }
 
   /**
-   * Build per-DocType top-level fields content, including embedded-creation
-   * guidance for types with hierarchy. PR3 will flesh this out further.
+   * One shared "## Standard top-level fields" section. The fields name/type
+   * are universal; img/folder are listed conditionally per-DocType where
+   * the per-template entries reference them.
+   * @returns {string}
+   */
+  _buildTopLevelFieldsSection() {
+    return [
+      '## Standard top-level fields',
+      '',
+      'These fields apply to the `data` object of every `create_document` call.',
+      'Per-template entries below show only the system-specific fields under `data.system`.',
+      '',
+      '- `name` (string, **required**) — display name',
+      '- `type` (string, **required** when the document type has subtypes) — subtype identifier (see per-template entries)',
+      '- `img` (file_path) — image path; use `search_assets` to find valid paths. Only on document types that support visuals (Actor, Item, Cards, Macro, RollTable, Scene).',
+      '- `folder` (string|null) — folder ID for organization. Only on document types that appear in the sidebar.',
+    ].join('\n');
+  }
+
+  /**
+   * Per-DocType "Embedded children" section, emitted only when the document
+   * class declares an embedded hierarchy. Skips the boilerplate top-level
+   * fields list (now shared).
    * @param {string} documentType
    * @returns {string|null}
    */
-  _buildDocumentFieldsContent(documentType) {
+  _buildEmbeddedChildrenSection(documentType) {
     const documentClass = CONFIG?.[documentType]?.documentClass;
     if (!documentClass) return null;
 
-    const lines = [`## ${documentType} — Top-level fields`, ''];
-    lines.push('Standard top-level fields for any ' + documentType + ' document:');
-    lines.push('- `name` (string, **required**) — display name');
-    lines.push('- `type` (string, **required**) — subtype identifier (see schemas above)');
-    lines.push('- `img` (file_path) — image path; use `search_assets` to find valid paths');
-    lines.push('- `folder` (string|null) — folder ID for organization');
-
     const hierarchy = documentClass.hierarchy;
-    if (hierarchy && Object.keys(hierarchy).length > 0) {
-      lines.push('');
-      lines.push(`### Embedded children of ${documentType}`);
-      lines.push('');
-      const embeddedNames = Object.keys(hierarchy);
-      lines.push(
-        `${documentType} can contain embedded documents of these types: ${embeddedNames.join(', ')}.`
-      );
-      lines.push(
-        `These are NOT created as standalone documents — they exist only as children of a ${documentType}.`
-      );
-    }
+    if (!hierarchy || Object.keys(hierarchy).length === 0) return null;
 
-    return lines.join('\n');
+    const embeddedNames = Object.keys(hierarchy);
+    return [
+      `## ${documentType} — Embedded children`,
+      '',
+      `${documentType} contains embedded documents of these types: ${embeddedNames.join(', ')}.`,
+      `These are NOT created as standalone documents — they exist only as children of a ${documentType}.`,
+    ].join('\n');
   }
 
   /**
@@ -861,9 +966,13 @@ class SchemaIndexService {
     const sections = [];
     const sharedByKey = new Map(shared.map(s => [s.key, s]));
 
-    // Order: preamble, uuid_format, per-DocType fields (sorted), per-template entries (sorted)
+    // Order: preamble, uuid_format, top_level_fields (shared), per-DocType
+    // embedded-children (sorted), per-template entries (sorted).
     if (sharedByKey.has('preamble')) sections.push(sharedByKey.get('preamble').content);
     if (sharedByKey.has('uuid_format')) sections.push(sharedByKey.get('uuid_format').content);
+    if (sharedByKey.has('top_level_fields')) {
+      sections.push(sharedByKey.get('top_level_fields').content);
+    }
 
     const docFields = shared
       .filter(s => s.key.startsWith('doc_fields::'))
